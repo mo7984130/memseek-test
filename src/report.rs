@@ -4,12 +4,13 @@ use std::{
     time::Duration,
 };
 
-use crate::{recorders::recorder::ScenarioRecorder, runner::RunnerResult};
+use crate::recorder::Recorder;
 
 #[derive(Debug)]
 pub struct ScenarioReport {
     pub name: &'static str,
     pub times: u64,
+    pub total: Duration,
     pub avg: Duration,
     pub min: Duration,
     pub max: Duration,
@@ -23,17 +24,11 @@ pub struct ScenarioReport {
 }
 
 impl ScenarioReport {
-    pub fn from_recorder<R: ScenarioRecorder>(
-        name: &'static str,
-        runner_result: RunnerResult<R>,
-    ) -> Self {
-        let RunnerResult {
-            mut recorder,
-            error_recorder,
-        } = runner_result;
+    pub fn from_recorder(name: &'static str, mut recorder: Recorder) -> Self {
         Self {
-            name,
+            name: name,
             times: recorder.times(),
+            total: recorder.total(),
             avg: recorder.avg(),
             min: recorder.min(),
             max: recorder.max(),
@@ -41,9 +36,9 @@ impl ScenarioReport {
             p95: recorder.p95(),
             p99: recorder.p99(),
 
-            success: error_recorder.success,
-            failures: error_recorder.failures,
-            error_map: error_recorder.error_map,
+            success: recorder.success,
+            failures: recorder.failures,
+            error_map: recorder.error_map,
         }
     }
 }
@@ -52,6 +47,7 @@ impl Display for ScenarioReport {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         writeln!(f, "Scenario: {}", self.name)?;
         writeln!(f, "  Times: {}", self.times)?;
+        writeln!(f, "  Total: {:?}", self.total)?;
         writeln!(f, "  Min:  {:?}", self.min)?;
         writeln!(f, "  Avg:  {:?}", self.avg)?;
         writeln!(f, "  Max:  {:?}", self.max)?;

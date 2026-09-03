@@ -1,71 +1,101 @@
+use std::any::Any;
+
 use futures::future::join_all;
-use std::marker::PhantomData;
 
 use crate::{
-    recorders::recorder::ScenarioRecorder,
+    registry::{ScenarioRegistration, ScenarioRegistry},
     report::ScenarioReport,
-    runner::{RunnerConfig, ScenarioRunner},
-    scenario::Scenario,
+    runner::{RunMode, RunnerConfig},
 };
 
 pub struct ManagerConfig {
+    /// 并发度
     concurrency: u64,
-    total: u64,
+    /// 运行模式, 存在的情况下会覆盖scenario配置
+    run_mode: Option<RunMode>,
 }
 impl ManagerConfig {
-    pub fn new(total: u64, concurrency: u64) -> Self {
-        if total == 0 {
-            panic!("Manager Config total cannot be zero");
-        }
+    pub fn new(concurrency: u64) -> Self {
         if concurrency == 0 {
             panic!("Manager Config concurrency cannot be zero");
         }
-        Self { concurrency, total }
-    }
-}
-
-pub struct ScenarioManager<S, R> {
-    config: ManagerConfig,
-    _marker1: PhantomData<S>,
-    _marker2: PhantomData<R>,
-}
-
-impl<S, R> ScenarioManager<S, R>
-where
-    S: Scenario,
-    R: ScenarioRecorder,
-{
-    pub fn new(config: ManagerConfig) -> Self {
         Self {
-            config,
-            _marker1: PhantomData,
-            _marker2: PhantomData,
+            concurrency,
+            run_mode: None,
         }
     }
 
-    pub async fn run(&self, ctx: &S::Ctx) -> ScenarioReport {
-        let cfg = &self.config;
+    pub fn with_run_mode(&mut self, run_mode: RunMode) -> &Self {
+        self.run_mode = Some(run_mode);
+        self
+    }
+}
 
-        let concurrency = cfg.concurrency.min(cfg.total);
+pub struct ScenarioManager {
+    config: ManagerConfig,
+}
 
-        let base = cfg.total / concurrency;
-        let remainder = cfg.total % concurrency;
+impl ScenarioManager {
+    pub fn new(config: ManagerConfig) -> Self {
+        Self { config }
+    }
 
-        let futures = (0..concurrency).map(|i| {
-            let once = base + u64::from(i < remainder);
+    pub async fn run_all<Ctx: Any + Sync>(&self, ctx: &Ctx) -> Vec<ScenarioReport> {
+        let scenarios = ScenarioRegistry::scenarios::<Ctx>();
+        self.run(ctx, &scenarios).await
+    }
 
-            let mut runner = ScenarioRunner::<R>::new(RunnerConfig { times: once });
-            async move { runner.run::<S>(&ctx).await }
-        });
-
-        let mut results = join_all(futures).await;
-
-        let mut result = results.pop().expect("concurrency must be greater than 0");
-
-        for other in results {
-            result.merge(other);
+    pub async fn run<Ctx: Any + Sync>(
+        &self,
+        ctx: &Ctx,
+        scenarios: &[&'static ScenarioRegistration],
+    ) -> Vec<ScenarioReport> {
+        let mut reports = Vec::with_capacity(scenarios.len());
+        for s in scenarios {
+            reports.push(self.run_entry(s, ctx).await);
         }
+        reports
+    }
 
-        ScenarioReport::from_recorder(S::name(), result)
+    pub async fn run_one<Ctx: Any + Sync>(&self, name: &str, ctx: &Ctx) -> Option<ScenarioReport> {
+        let s = ScenarioRegistry::find::<Ctx>(name)?;
+        Some(self.run_entry(s, ctx).await)
+    }
+
+    async fn run_entry(&self, entry: &ScenarioRegistration, ctx: &dyn Any) -> ScenarioReport {
+        let mode = self
+            .config
+            .run_mode
+            .or(entry.config.run_mode)
+            .expect("scenario 未配置执行模式(times/duration)");
+
+        let concurrency = self.config.concurrency;
+
+        let cfgs: Vec<RunnerConfig> = match mode {
+            RunMode::Times(total) => {
+                let base = total / concurrency;
+                let rem = total % concurrency;
+                (0..concurrency)
+                    .map(|i| RunnerConfig {
+                        mode: RunMode::Times(base + u64::from(i < rem)),
+                    })
+                    .collect()
+            }
+            RunMode::Duration(d) => (0..concurrency)
+                .map(|_| RunnerConfig {
+                    mode: RunMode::Duration(d),
+                })
+                .collect(),
+        };
+
+        let futures: Vec<_> = cfgs.iter().map(|c| (entry.invoke)(ctx, c)).collect();
+        let results = join_all(futures).await;
+
+        let mut it = results.into_iter();
+        let mut merged = it.next().expect("concurrency must be > 0");
+        for other in it {
+            merged.merge(other);
+        }
+        ScenarioReport::from_recorder(entry.name, merged)
     }
 }

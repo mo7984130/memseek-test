@@ -1,30 +1,30 @@
-use std::marker::PhantomData;
-use std::time::Instant;
+use std::{
+    marker::PhantomData,
+    time::{Duration, Instant},
+};
 
-use crate::recorders::error_recorder::ErrorRecorder;
-use crate::recorders::recorder::ScenarioRecorder;
-use crate::scenario::Scenario;
+use crate::{error::ScenarioError, recorder::Recorder, scenario::Scenario};
+
+#[derive(Clone, Copy, Debug)]
+pub enum RunMode {
+    Times(u64),
+    Duration(Duration),
+}
 
 pub struct RunnerConfig {
-    pub times: u64,
+    pub mode: RunMode,
 }
 
-pub struct RunnerResult<R: ScenarioRecorder> {
-    pub recorder: R,
-    pub error_recorder: ErrorRecorder,
-}
-impl<R: ScenarioRecorder> RunnerResult<R> {
-    pub fn merge(&mut self, other: Self) {
-        self.recorder.merge(other.recorder);
-        self.error_recorder.merge(other.error_recorder);
-    }
-}
-
-pub struct ScenarioRunner<R: ScenarioRecorder> {
+pub struct ScenarioRunner<S> {
     config: RunnerConfig,
-    _marker: PhantomData<R>,
+    _marker: PhantomData<S>,
 }
-impl<R: ScenarioRecorder> ScenarioRunner<R> {
+
+impl<S> ScenarioRunner<S>
+where
+    S: Scenario,
+    S::Error: ScenarioError,
+{
     pub fn new(config: RunnerConfig) -> Self {
         Self {
             config,
@@ -32,25 +32,33 @@ impl<R: ScenarioRecorder> ScenarioRunner<R> {
         }
     }
 
-    pub async fn run<S>(&mut self, ctx: &S::Ctx) -> RunnerResult<R>
-    where
-        S: Scenario,
-    {
-        let mut recorder = R::from_config(&self.config);
-        let mut error_recorder = ErrorRecorder::new();
+    pub async fn run(&self, ctx: &S::Ctx) -> Recorder {
+        let mut recorder = Recorder::from_config(&self.config);
+        match self.config.mode {
+            RunMode::Times(times) => {
+                for _ in 0..times {
+                    Self::once(ctx, &mut recorder).await;
+                }
+            }
+            RunMode::Duration(deadline) => {
+                let dl = Instant::now() + deadline;
+                loop {
+                    Self::once(ctx, &mut recorder).await;
+                    if Instant::now() >= dl {
+                        break;
+                    }
+                }
+            }
+        };
 
-        for _ in 0..self.config.times {
-            let start = Instant::now();
+        recorder
+    }
 
-            let result = S::run(ctx).await;
+    async fn once(ctx: &S::Ctx, recorder: &mut Recorder) {
+        let start = Instant::now();
+        let result = S::run(ctx).await;
 
-            recorder.record(start.elapsed());
-            error_recorder.record(&result);
-        }
-
-        RunnerResult {
-            recorder,
-            error_recorder,
-        }
+        recorder.record_duration(start.elapsed());
+        recorder.record_result(&result);
     }
 }
