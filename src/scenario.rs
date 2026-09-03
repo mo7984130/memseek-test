@@ -8,6 +8,5 @@ pub trait Scenario: Default + Send + Sync + 'static {
 
     fn run(ctx: &Self::Ctx) -> impl Future<Output = std::result::Result<(), Self::Error>>;
 
-    #[cfg(feature = "validate")]
     fn validate(ctx: &Self::Ctx) -> impl Future<Output = bool>;
 }

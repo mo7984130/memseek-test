@@ -7,6 +7,9 @@
 //!     ctx = AuthContext,
 //!     error = ctxlibs::http_client::HttpError,
 //!     mode = memseek_test::RunMode::Times(10000),  // 可选:执行模式,不写则 mode 为空
+//!     validate = v => {                            // 可选:预检,不写默认 true
+//!         v.client.get("/ping").await.is_ok()
+//!     }
 //!     // 并发由 Manager 统一管理。
 //!     run: ctx => {                // `ctx` 是参数名(macro_rules 卫生性:须由调用方提供)
 //!         let resp = ctx.client.get("/hello").await?;
@@ -26,6 +29,8 @@
 /// 配置项:
 /// - `mode = RunMode::Times(n)` 或 `mode = RunMode::Duration(d)`:执行模式(可选,
 ///   不写则 mode 为空,由 Manager 的 `with_run_mode` 覆盖/决定);
+/// - `validate = v => { ... }`:预检逻辑(可选,参数名由调用方提供),
+///   未提供时默认返回 `true`。
 /// 并发由 Manager 统一管理(`ManagerConfig::new(concurrency)`)。
 #[macro_export]
 macro_rules! scenario {
@@ -35,6 +40,7 @@ macro_rules! scenario {
         error = $err:ty,
         $(name = $name:literal,)?
         $(mode = $mode:expr,)?
+        $(validate = $validate:ident => $validate_body:block,)?
         run: $run:ident => $body:block
     ) => {
         #[derive(Default)]
@@ -62,6 +68,12 @@ macro_rules! scenario {
             {
                 // Box::pin + async move 在这里生成,使用者不写
                 ::std::boxed::Box::pin(async move $body)
+            }
+
+            fn validate(
+                $crate::__scenario_validate_arg!($($validate)?): &Self::Ctx,
+            ) -> impl ::core::future::Future<Output = bool> {
+                $crate::__scenario_validate_body!($($validate_body)?)
             }
         }
 
@@ -93,6 +105,30 @@ macro_rules! __scenario_opt {
     };
     ($e:expr) => {
         ::core::option::Option::Some($e)
+    };
+}
+
+/// validate 参数名:用户提供的 `$v`,未提供则用 `_ctx`。
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __scenario_validate_arg {
+    ($v:ident) => {
+        $v
+    };
+    () => {
+        _ctx
+    };
+}
+
+/// validate 函数体:用户提供则原样包 async,未提供默认 `true`。
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __scenario_validate_body {
+    ($b:block) => {
+        async move $b
+    };
+    () => {
+        async move { true }
     };
 }
 

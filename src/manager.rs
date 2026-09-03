@@ -8,6 +8,7 @@ use crate::{
     runner::{RunMode, RunnerConfig},
 };
 
+#[derive(Debug, Clone, Copy)]
 pub struct ManagerConfig {
     /// 并发度
     concurrency: u64,
@@ -25,7 +26,7 @@ impl ManagerConfig {
         }
     }
 
-    pub fn with_run_mode(&mut self, run_mode: RunMode) -> &Self {
+    pub fn with_run_mode(mut self, run_mode: RunMode) -> Self {
         self.run_mode = Some(run_mode);
         self
     }
@@ -67,7 +68,7 @@ impl ScenarioManager {
             .config
             .run_mode
             .or(entry.config.run_mode)
-            .expect("scenario 未配置执行模式(times/duration)");
+            .expect(&format!("{} 未配置执行模式(times/duration)", entry.name));
 
         let concurrency = self.config.concurrency;
 

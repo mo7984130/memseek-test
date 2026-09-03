@@ -18,6 +18,9 @@ pub struct ScenarioReport {
     pub p95: Duration,
     pub p99: Duration,
 
+    pub validate_success: u64,
+    pub validate_failures: u64,
+
     pub success: u64,
     pub failures: u64,
     pub error_map: HashMap<&'static str, u64>,
@@ -35,6 +38,9 @@ impl ScenarioReport {
             p50: recorder.p50(),
             p95: recorder.p95(),
             p99: recorder.p99(),
+
+            validate_success: recorder.validate_success,
+            validate_failures: recorder.validate_failures,
 
             success: recorder.success,
             failures: recorder.failures,
@@ -54,6 +60,9 @@ impl Display for ScenarioReport {
         writeln!(f, "  P50:  {:?}", self.p50)?;
         writeln!(f, "  P95:  {:?}", self.p95)?;
         writeln!(f, "  P99:  {:?}", self.p99)?;
+
+        writeln!(f, "  Validate Success:  {}", self.validate_success)?;
+        writeln!(f, "  Validate Failures: {}", self.validate_failures)?;
 
         writeln!(f, "  Success: {}", self.success)?;
         writeln!(f, "  Failures: {}", self.failures)?;

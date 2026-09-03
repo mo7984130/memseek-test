@@ -8,9 +8,13 @@ use crate::{error::ScenarioError, runner::RunnerConfig};
 pub struct Recorder {
     histogram: Histogram<u64>,
     total: Duration,
+
     pub success: u64,
     pub failures: u64,
     pub error_map: HashMap<&'static str, u64>,
+
+    pub validate_success: u64,
+    pub validate_failures: u64,
 }
 
 impl Default for Recorder {
@@ -27,18 +31,13 @@ impl Recorder {
             success: 0,
             failures: 0,
             error_map: HashMap::new(),
+            validate_success: 0,
+            validate_failures: 0,
         }
     }
 
     pub fn from_config(_config: &RunnerConfig) -> Self {
         Self::new()
-    }
-
-    pub fn record_duration(&mut self, duration: Duration) {
-        self.histogram
-            .record(duration.as_micros() as u64)
-            .expect("duration is out of histogram range");
-        self.total += duration;
     }
 
     pub fn total(&self) -> Duration {
@@ -94,6 +93,16 @@ impl Recorder {
         for (kind, count) in other.error_map {
             *self.error_map.entry(kind).or_insert(0) += count;
         }
+
+        self.validate_success += other.validate_success;
+        self.validate_failures += other.validate_failures
+    }
+
+    pub fn record_duration(&mut self, duration: Duration) {
+        self.histogram
+            .record(duration.as_micros() as u64)
+            .expect("duration is out of histogram range");
+        self.total += duration;
     }
 
     pub fn record_result<T, E>(&mut self, result: &std::result::Result<T, E>)
@@ -109,6 +118,17 @@ impl Recorder {
                     .entry(err.kind())
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
+            }
+        }
+    }
+
+    pub fn record_validate(&mut self, validate_result: bool) {
+        match validate_result {
+            true => {
+                self.validate_success += 1;
+            }
+            false => {
+                self.validate_failures += 1;
             }
         }
     }

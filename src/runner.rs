@@ -38,15 +38,21 @@ where
             RunMode::Times(times) => {
                 for _ in 0..times {
                     Self::once(ctx, &mut recorder).await;
+                    Self::validate(ctx, &mut recorder).await;
                 }
             }
-            RunMode::Duration(deadline) => {
-                let dl = Instant::now() + deadline;
-                loop {
+            RunMode::Duration(duration) => {
+                let mut remaining = duration;
+
+                while !remaining.is_zero() {
+                    let start = Instant::now();
+
                     Self::once(ctx, &mut recorder).await;
-                    if Instant::now() >= dl {
-                        break;
-                    }
+
+                    let elapsed = start.elapsed();
+                    remaining = remaining.saturating_sub(elapsed);
+
+                    Self::validate(ctx, &mut recorder).await;
                 }
             }
         };
@@ -60,5 +66,9 @@ where
 
         recorder.record_duration(start.elapsed());
         recorder.record_result(&result);
+    }
+
+    async fn validate(ctx: &S::Ctx, recorder: &mut Recorder) {
+        recorder.record_validate(S::validate(ctx).await);
     }
 }
