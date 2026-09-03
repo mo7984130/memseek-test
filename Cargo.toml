@@ -1,0 +1,17 @@
+[package]
+name = "memseek-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.34"
+hdrhistogram = "7.6.0"
+reqwest = { version = "0.13.4", features = ["rustls"] }
+thiserror = "2.0.20"
+tokio = "1.53.1"
+tracing = "0.1.44"
+url = "2.5.8"
+
+[features]
+default = []
+validate = []
