@@ -88,6 +88,7 @@ impl Recorder {
         self.histogram
             .add(other.histogram)
             .expect("merge Recorder failed");
+        self.total += other.total;
         self.success += other.success;
         self.failures += other.failures;
         for (kind, count) in other.error_map {
