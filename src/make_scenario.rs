@@ -13,13 +13,16 @@
 //! impl Scenario for HelloScenario {
 //!     type Ctx = AuthContext;
 //!     type Error = ctxlibs::http_client::HttpError;
+//!     type Output = ();
 //!
 //!     async fn run(ctx: &AuthContext) -> Result<(), Self::Error> {
 //!         let resp = ctx.client.get("/hello").await?;
 //!         Ok(())
 //!     }
 //!
-//!     // validate() / name() 均有默认实现,按需覆盖即可
+//!     // validate() / name() 均有默认实现,按需覆盖即可;
+//!     // 覆盖 validate 时可接收 run 的产出(output)做业务断言;
+//!     // run 返回 Err 时该轮直接记为失败,不会进入 validate
 //! }
 //!
 //! // 在模块底部注册。可选配置:

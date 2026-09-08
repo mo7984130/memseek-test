@@ -39,8 +39,11 @@ where
         match self.config.mode {
             RunMode::Times(times) => {
                 for _ in 0..times {
-                    Self::once(ctx, &mut recorder).await;
-                    Self::validate(ctx, &mut recorder).await;
+                    let result = Self::once(ctx, &mut recorder).await;
+                    // run 失败已记录,不再进入 validate
+                    if let Ok(output) = &result {
+                        Self::validate(ctx, output, &mut recorder).await;
+                    }
                 }
             }
             RunMode::Duration(duration) => {
@@ -49,12 +52,15 @@ where
                 while !remaining.is_zero() {
                     let start = Instant::now();
 
-                    Self::once(ctx, &mut recorder).await;
+                    let result = Self::once(ctx, &mut recorder).await;
 
                     let elapsed = start.elapsed();
                     remaining = remaining.saturating_sub(elapsed);
 
-                    Self::validate(ctx, &mut recorder).await;
+                    // run 失败已记录,不再进入 validate
+                    if let Ok(output) = &result {
+                        Self::validate(ctx, output, &mut recorder).await;
+                    }
                 }
             }
         };
@@ -62,16 +68,20 @@ where
         recorder
     }
 
-    async fn once(ctx: &S::Ctx, recorder: &mut Recorder) {
+    /// 执行一次 `run` 并记录耗时/结果,返回本轮产出。
+    /// `Err` 已在记录时计为失败,调用方不再进入 validate。
+    async fn once(ctx: &S::Ctx, recorder: &mut Recorder) -> Result<S::Output, S::Error> {
         let start = Instant::now();
         let result = S::run(ctx).await;
 
         recorder.record_duration(start.elapsed());
         recorder.record_result(&result);
+        result
     }
 
-    async fn validate(ctx: &S::Ctx, recorder: &mut Recorder) {
-        let ret = S::validate(ctx).await;
+    /// 校验 run 的成功产出;`Err` 同样记为一次 validate 失败。
+    async fn validate(ctx: &S::Ctx, output: &S::Output, recorder: &mut Recorder) {
+        let ret = S::validate(ctx, output).await;
         match ret {
             Ok(validated) => {
                 recorder.record_validate(validated);
