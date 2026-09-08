@@ -79,12 +79,16 @@ impl ScenarioManager {
                 (0..concurrency)
                     .map(|i| RunnerConfig {
                         mode: RunMode::Times(base + u64::from(i < rem)),
+                        task_index: i as usize,
+                        task_total: concurrency as usize,
                     })
                     .collect()
             }
             RunMode::Duration(d) => (0..concurrency)
-                .map(|_| RunnerConfig {
+                .map(|i| RunnerConfig {
                     mode: RunMode::Duration(d),
+                    task_index: i as usize,
+                    task_total: concurrency as usize,
                 })
                 .collect(),
         };

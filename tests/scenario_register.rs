@@ -1,7 +1,10 @@
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
 
 use memseek_test::{
-    RunMode,
+    RunMode, TaskIndex,
     error::ScenarioError,
     manager::{ManagerConfig, ScenarioManager},
     register_scenario,
@@ -29,7 +32,7 @@ impl Scenario for HelloScenario {
     type Error = TestError;
     type Output = ();
 
-    async fn run(_ctx: &AuthContext) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -46,7 +49,7 @@ impl Scenario for NamedScenario {
     type Error = TestError;
     type Output = ();
 
-    async fn run(_ctx: &AuthContext) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -66,11 +69,15 @@ impl Scenario for OutputScenario {
     type Error = TestError;
     type Output = u32;
 
-    async fn run(_ctx: &AuthContext) -> Result<u32, Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<u32, Self::Error> {
         Ok(42)
     }
 
-    async fn validate(_ctx: &AuthContext, output: &u32) -> Result<bool, Self::Error> {
+    async fn validate(
+        _ctx: &AuthContext,
+        _task: &TaskIndex,
+        output: &u32,
+    ) -> Result<bool, Self::Error> {
         Ok(*output == 42)
     }
 }
@@ -139,7 +146,7 @@ impl Scenario for FailingScenario {
     type Error = TestError;
     type Output = ();
 
-    async fn run(_ctx: &AuthContext) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<(), Self::Error> {
         Err(TestError)
     }
 }
@@ -177,11 +184,15 @@ impl Scenario for BadOutputScenario {
     type Error = TestError;
     type Output = u32;
 
-    async fn run(_ctx: &AuthContext) -> Result<u32, Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<u32, Self::Error> {
         Ok(43)
     }
 
-    async fn validate(_ctx: &AuthContext, output: &u32) -> Result<bool, Self::Error> {
+    async fn validate(
+        _ctx: &AuthContext,
+        _task: &TaskIndex,
+        output: &u32,
+    ) -> Result<bool, Self::Error> {
         Ok(*output == 42)
     }
 }
@@ -207,4 +218,59 @@ fn validate_failure_is_recorded() {
         assert_eq!(report.validate_success, 0);
         assert_eq!(report.validate_failures, 1);
     });
+}
+
+/// 每个并发任务收到唯一的 `task.index`,可用于账号等参数化。
+struct IndexCtx {
+    seen: Arc<Mutex<Vec<usize>>>,
+}
+
+#[derive(Default)]
+struct IndexScenario;
+
+impl Scenario for IndexScenario {
+    type Ctx = IndexCtx;
+    type Error = TestError;
+    type Output = usize;
+
+    async fn run(ctx: &Self::Ctx, task: &TaskIndex) -> Result<usize, Self::Error> {
+        ctx.seen.lock().unwrap().push(task.index);
+        Ok(task.index)
+    }
+
+    async fn validate(
+        _ctx: &Self::Ctx,
+        task: &TaskIndex,
+        output: &usize,
+    ) -> Result<bool, Self::Error> {
+        Ok(*output == task.index)
+    }
+}
+
+register_scenario!(IndexScenario);
+
+#[test]
+fn task_index_is_assigned_per_concurrent_task() {
+    let ctx = IndexCtx {
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let manager = ScenarioManager::new(ManagerConfig::new(4).with_run_mode(RunMode::Times(4)));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let report = manager
+            .run_one::<IndexCtx>("IndexScenario", &ctx)
+            .await
+            .expect("scenario should be found");
+        assert_eq!(report.success, 4);
+        assert_eq!(report.validate_success, 4);
+    });
+
+    // 4 个并发任务分别拿到 0..4 的唯一编号
+    let mut seen = ctx.seen.lock().unwrap().clone();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![0, 1, 2, 3]);
 }

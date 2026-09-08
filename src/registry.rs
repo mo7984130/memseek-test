@@ -49,7 +49,11 @@ where
 {
     let ctx = ctx.downcast_ref::<S::Ctx>().expect("Ctx 类型不匹配");
     Box::pin(async move {
-        let runner = ScenarioRunner::<S>::new(RunnerConfig { mode: cfg.mode });
+        let runner = ScenarioRunner::<S>::new(RunnerConfig {
+            mode: cfg.mode,
+            task_index: cfg.task_index,
+            task_total: cfg.task_total,
+        });
         runner.run(ctx).await
     })
 }
