@@ -1,13 +1,16 @@
 [package]
 name = "memseek-test"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
 futures = "0.3.34"
 hdrhistogram = "7.6.0"
 inventory = "0.3"
-reqwest = { version = "0.13.4", features = ["rustls"] }
+reqwest = { version = "0.13.4", features = ["rustls", "json", "form", "query"] }
+serde = "1.0.229"
+serde_json = "1.0.151"
+serde_urlencoded = "0.7"
 thiserror = "2.0.20"
 tokio = "1.53.1"
 tracing = "0.1.44"

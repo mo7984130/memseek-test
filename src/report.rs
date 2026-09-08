@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt::{Display, Formatter, Result},
     time::Duration,
@@ -8,7 +9,7 @@ use crate::recorder::Recorder;
 
 #[derive(Debug)]
 pub struct ScenarioReport {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub times: u64,
     pub total: Duration,
     pub avg: Duration,
@@ -23,13 +24,13 @@ pub struct ScenarioReport {
 
     pub success: u64,
     pub failures: u64,
-    pub error_map: HashMap<&'static str, u64>,
+    pub error_map: HashMap<Cow<'static, str>, u64>,
 }
 
 impl ScenarioReport {
-    pub fn from_recorder(name: &'static str, mut recorder: Recorder) -> Self {
+    pub fn from_recorder(name: impl Into<Cow<'static, str>>, mut recorder: Recorder) -> Self {
         Self {
-            name: name,
+            name: name.into(),
             times: recorder.times(),
             total: recorder.total(),
             avg: recorder.avg(),

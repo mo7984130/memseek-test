@@ -3,6 +3,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tracing::warn;
+
 use crate::{error::ScenarioError, recorder::Recorder, scenario::Scenario};
 
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +71,15 @@ where
     }
 
     async fn validate(ctx: &S::Ctx, recorder: &mut Recorder) {
-        recorder.record_validate(S::validate(ctx).await);
+        let ret = S::validate(ctx).await;
+        match ret {
+            Ok(validated) => {
+                recorder.record_validate(validated);
+            }
+            Err(err) => {
+                warn!("{:#?}", err);
+                recorder.record_validate(false);
+            }
+        }
     }
 }

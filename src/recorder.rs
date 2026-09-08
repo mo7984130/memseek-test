@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{borrow::Cow, collections::HashMap, time::Duration};
 
 use hdrhistogram::Histogram;
 use tracing::warn;
@@ -11,7 +11,7 @@ pub struct Recorder {
 
     pub success: u64,
     pub failures: u64,
-    pub error_map: HashMap<&'static str, u64>,
+    pub error_map: HashMap<Cow<'static, str>, u64>,
 
     pub validate_success: u64,
     pub validate_failures: u64,

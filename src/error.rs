@@ -1,5 +1,5 @@
-use std::fmt::Debug;
+use std::{borrow::Cow, fmt::Debug};
 
 pub trait ScenarioError: Debug {
-    fn kind(&self) -> &'static str;
+    fn kind(&self) -> Cow<'static, str>;
 }

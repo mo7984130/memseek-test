@@ -1,86 +1,60 @@
-//! `scenario!` 宏:定义并注册一个场景。
+//! 场景注册:`register_scenario!` 宏。
+//!
+//! 与旧 `scenario!` 宏不同,这里**业务代码外置**:使用者手写普通
+//! `struct` + `impl Scenario`(真实代码,rust-analyzer 可完整分析,
+//! 支持补全/跳转/诊断),`register_scenario!` 只负责生成 inventory 注册条目。
 //!
 //! 用法:
 //! ```ignore
-//! memseek_test::scenario! {
-//!     HelloScenario,
-//!     ctx = AuthContext,
-//!     error = ctxlibs::http_client::HttpError,
-//!     mode = memseek_test::RunMode::Times(10000),  // 可选:执行模式,不写则 mode 为空
-//!     validate = v => {                            // 可选:预检,不写默认 true
-//!         v.client.get("/ping").await.is_ok()
-//!     }
-//!     // 并发由 Manager 统一管理。
-//!     run: ctx => {                // `ctx` 是参数名(macro_rules 卫生性:须由调用方提供)
+//! use memseek_test::{register_scenario, scenario::Scenario, RunMode};
+//!
+//! struct HelloScenario;
+//!
+//! impl Scenario for HelloScenario {
+//!     type Ctx = AuthContext;
+//!     type Error = ctxlibs::http_client::HttpError;
+//!
+//!     async fn run(ctx: &AuthContext) -> Result<(), Self::Error> {
 //!         let resp = ctx.client.get("/hello").await?;
 //!         Ok(())
 //!     }
+//!
+//!     // validate() / name() 均有默认实现,按需覆盖即可
 //! }
+//!
+//! // 在模块底部注册。可选配置:
+//! //   name = "..." 覆盖匹配名(默认类型简单名)
+//! //   mode = RunMode::Times(n) | RunMode::Duration(d) 设置默认执行模式
+//! register_scenario!(HelloScenario, mode = RunMode::Times(10000));
 //! ```
 //!
-//! 宏生成:
-//! 1. `pub struct HelloScenario`(unit struct,自动 `Default`);
-//! 2. `impl Scenario`(run 自动包成 `Pin<Box<dyn Future + '_>>`,
-//!    使用者不需要写 `Box::pin` / `async move`);
-//! 3. 一个 `ScenarioRegistration` 条目(含场景配置),编译期 `inventory::submit!`。
+//! 并发由 Manager 统一管理(`ManagerConfig::new(concurrency)`)。
 
-/// 定义并注册一个场景。
+/// 注册一个已实现 `Scenario` 的场景类型,生成 inventory 注册条目。
 ///
-/// 配置项:
-/// - `mode = RunMode::Times(n)` 或 `mode = RunMode::Duration(d)`:执行模式(可选,
-///   不写则 mode 为空,由 Manager 的 `with_run_mode` 覆盖/决定);
-/// - `validate = v => { ... }`:预检逻辑(可选,参数名由调用方提供),
-///   未提供时默认返回 `true`。
-/// 并发由 Manager 统一管理(`ManagerConfig::new(concurrency)`)。
+/// 可选参数:
+/// - `name = "..."`:覆盖匹配名(默认类型简单名);
+/// - `mode = RunMode::Times(n)` / `RunMode::Duration(d)`:默认执行模式
+///   (缺省为 `None`,由 Manager 的 `with_run_mode` 覆盖/决定)。
 #[macro_export]
-macro_rules! scenario {
+macro_rules! register_scenario {
     (
-        $ty:ident,
-        ctx = $ctx:ty,
-        error = $err:ty,
-        $(name = $name:literal,)?
-        $(mode = $mode:expr,)?
-        $(validate = $validate:ident => $validate_body:block,)?
-        run: $run:ident => $body:block
+        $ty:ident
+        $(, name = $name:literal)?
+        $(, mode = $mode:expr)?
     ) => {
-        #[derive(Default)]
-        pub struct $ty;
-
-        impl $crate::scenario::Scenario for $ty {
-            type Ctx = $ctx;
-            type Error = $err;
-
-            fn name() -> &'static str {
-                $crate::__scenario_name!(
-                    $ty
-                    $(, $name)?
-                )
-            }
-
-            fn run($run: &Self::Ctx)
-                -> ::core::pin::Pin<
-                    ::std::boxed::Box<
-                        dyn ::core::future::Future<
-                            Output = ::core::result::Result<(), Self::Error>,
-                        > + '_,
-                    >,
-                >
-            {
-                // Box::pin + async move 在这里生成,使用者不写
-                ::std::boxed::Box::pin(async move $body)
-            }
-
-            fn validate(
-                $crate::__scenario_validate_arg!($($validate)?): &Self::Ctx,
-            ) -> impl ::core::future::Future<Output = bool> {
-                $crate::__scenario_validate_body!($($validate_body)?)
+        $crate::inventory::submit! {
+            $crate::registry::ScenarioRegistration {
+                name: $crate::__scenario_name!($ty $(, $name)?),
+                ctx_type: || ::core::any::TypeId::of::<
+                    <$ty as $crate::scenario::Scenario>::Ctx,
+                >(),
+                config: $crate::registry::ScenarioConfig::new(
+                    $crate::__scenario_opt!($($mode)?)
+                ),
+                invoke: $crate::registry::invoke::<$ty>,
             }
         }
-
-        $crate::register_scenario!(
-            $ty,
-            $crate::__scenario_opt!($($mode)?)
-        );
     };
 }
 
@@ -105,49 +79,5 @@ macro_rules! __scenario_opt {
     };
     ($e:expr) => {
         ::core::option::Option::Some($e)
-    };
-}
-
-/// validate 参数名:用户提供的 `$v`,未提供则用 `_ctx`。
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __scenario_validate_arg {
-    ($v:ident) => {
-        $v
-    };
-    () => {
-        _ctx
-    };
-}
-
-/// validate 函数体:用户提供则原样包 async,未提供默认 `true`。
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __scenario_validate_body {
-    ($b:block) => {
-        async move $b
-    };
-    () => {
-        async move { true }
-    };
-}
-
-/// 内部宏:#[doc(hidden)],被 `scenario!` 调用,生成 inventory 注册条目。
-#[doc(hidden)]
-#[macro_export]
-macro_rules! register_scenario {
-    ($ty:ident, $mode:expr) => {
-        $crate::inventory::submit! {
-            $crate::registry::ScenarioRegistration {
-                name: ::core::stringify!($ty),
-                ctx_type: || ::core::any::TypeId::of::<
-                    <$ty as $crate::scenario::Scenario>::Ctx,
-                >(),
-                config: $crate::registry::ScenarioConfig::new(
-                    $mode,
-                ),
-                invoke: $crate::registry::invoke::<$ty>,
-            }
-        }
     };
 }
