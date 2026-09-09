@@ -59,13 +59,24 @@ where
     pub async fn run(&self, ctx: &S::Ctx) -> Recorder {
         let task = TaskIndex::new(self.config.task_index, self.config.task_total);
         let mut recorder = Recorder::from_config(&self.config);
+
+        // preset 阶段:每个任务执行一次,产出注入后续每轮 run/validate。
+        // 失败时该任务直接中止,记一次失败,不计入耗时分布。
+        let preset = match S::preset(ctx, &task).await {
+            Ok(preset) => preset,
+            Err(err) => {
+                recorder.record_result(&Err::<(), S::Error>(err));
+                return recorder;
+            }
+        };
+
         match self.config.mode {
             RunMode::Times(times) => {
                 for _ in 0..times {
-                    let result = Self::once(ctx, &task, &mut recorder).await;
+                    let result = Self::once(ctx, &task, &preset, &mut recorder).await;
                     // run 失败已记录,不再进入 validate
                     if let Ok(output) = &result {
-                        Self::validate(ctx, &task, output, &mut recorder).await;
+                        Self::validate(ctx, &task, &preset, output, &mut recorder).await;
                     }
                 }
             }
@@ -75,14 +86,14 @@ where
                 while !remaining.is_zero() {
                     let start = Instant::now();
 
-                    let result = Self::once(ctx, &task, &mut recorder).await;
+                    let result = Self::once(ctx, &task, &preset, &mut recorder).await;
 
                     let elapsed = start.elapsed();
                     remaining = remaining.saturating_sub(elapsed);
 
                     // run 失败已记录,不再进入 validate
                     if let Ok(output) = &result {
-                        Self::validate(ctx, &task, output, &mut recorder).await;
+                        Self::validate(ctx, &task, &preset, output, &mut recorder).await;
                     }
                 }
             }
@@ -96,10 +107,11 @@ where
     async fn once(
         ctx: &S::Ctx,
         task: &TaskIndex,
+        preset: &S::Preset,
         recorder: &mut Recorder,
     ) -> Result<S::Output, S::Error> {
         let start = Instant::now();
-        let result = S::run(ctx, task).await;
+        let result = S::run(ctx, task, preset).await;
 
         recorder.record_duration(start.elapsed());
         recorder.record_result(&result);
@@ -107,8 +119,14 @@ where
     }
 
     /// 校验 run 的成功产出;`Err` 同样记为一次 validate 失败。
-    async fn validate(ctx: &S::Ctx, task: &TaskIndex, output: &S::Output, recorder: &mut Recorder) {
-        let ret = S::validate(ctx, task, output).await;
+    async fn validate(
+        ctx: &S::Ctx,
+        task: &TaskIndex,
+        preset: &S::Preset,
+        output: &S::Output,
+        recorder: &mut Recorder,
+    ) {
+        let ret = S::validate(ctx, task, preset, output).await;
         match ret {
             Ok(validated) => {
                 recorder.record_validate(validated);

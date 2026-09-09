@@ -31,8 +31,9 @@ impl Scenario for HelloScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = ();
+    type Preset = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -48,8 +49,9 @@ impl Scenario for NamedScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = ();
+    type Preset = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -68,14 +70,16 @@ impl Scenario for OutputScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = u32;
+    type Preset = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<u32, Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<u32, Self::Error> {
         Ok(42)
     }
 
     async fn validate(
         _ctx: &AuthContext,
         _task: &TaskIndex,
+        _preset: &(),
         output: &u32,
     ) -> Result<bool, Self::Error> {
         Ok(*output == 42)
@@ -145,8 +149,9 @@ impl Scenario for FailingScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = ();
+    type Preset = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<(), Self::Error> {
         Err(TestError)
     }
 }
@@ -183,14 +188,16 @@ impl Scenario for BadOutputScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = u32;
+    type Preset = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex) -> Result<u32, Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<u32, Self::Error> {
         Ok(43)
     }
 
     async fn validate(
         _ctx: &AuthContext,
         _task: &TaskIndex,
+        _preset: &(),
         output: &u32,
     ) -> Result<bool, Self::Error> {
         Ok(*output == 42)
@@ -232,8 +239,9 @@ impl Scenario for IndexScenario {
     type Ctx = IndexCtx;
     type Error = TestError;
     type Output = usize;
+    type Preset = ();
 
-    async fn run(ctx: &Self::Ctx, task: &TaskIndex) -> Result<usize, Self::Error> {
+    async fn run(ctx: &Self::Ctx, task: &TaskIndex, _preset: &()) -> Result<usize, Self::Error> {
         ctx.seen.lock().unwrap().push(task.index);
         Ok(task.index)
     }
@@ -241,6 +249,7 @@ impl Scenario for IndexScenario {
     async fn validate(
         _ctx: &Self::Ctx,
         task: &TaskIndex,
+        _preset: &(),
         output: &usize,
     ) -> Result<bool, Self::Error> {
         Ok(*output == task.index)
@@ -273,4 +282,145 @@ fn task_index_is_assigned_per_concurrent_task() {
     let mut seen = ctx.seen.lock().unwrap().clone();
     seen.sort_unstable();
     assert_eq!(seen, vec![0, 1, 2, 3]);
+}
+
+/// preset 阶段:每个任务执行一次,产出注入每轮 run/validate。
+struct PresetCtx {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct PresetScenario;
+
+impl Scenario for PresetScenario {
+    type Ctx = PresetCtx;
+    type Error = TestError;
+    type Output = String;
+    type Preset = String;
+
+    async fn preset(ctx: &PresetCtx, task: &TaskIndex) -> Result<String, Self::Error> {
+        ctx.events
+            .lock()
+            .unwrap()
+            .push(format!("preset-{}", task.index));
+        Ok(format!("token-{}", task.index))
+    }
+
+    async fn run(
+        ctx: &PresetCtx,
+        task: &TaskIndex,
+        preset: &String,
+    ) -> Result<String, Self::Error> {
+        ctx.events
+            .lock()
+            .unwrap()
+            .push(format!("run-{}", task.index));
+        Ok(format!("{}-{}", preset, task.index))
+    }
+
+    async fn validate(
+        ctx: &PresetCtx,
+        task: &TaskIndex,
+        preset: &String,
+        output: &String,
+    ) -> Result<bool, Self::Error> {
+        ctx.events
+            .lock()
+            .unwrap()
+            .push(format!("validate-{}", task.index));
+        Ok(output == &format!("{}-{}", preset, task.index))
+    }
+}
+
+register_scenario!(PresetScenario);
+
+#[test]
+fn preset_runs_once_before_each_task_and_feeds_run() {
+    let ctx = PresetCtx {
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let manager = ScenarioManager::new(ManagerConfig::new(2).with_run_mode(RunMode::Times(4)));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let report = manager
+            .run_one::<PresetCtx>("PresetScenario", &ctx)
+            .await
+            .expect("scenario should be found");
+        // run 每轮都拿到了 preset 注入的 token,validate 断言全部通过
+        assert_eq!(report.success, 4);
+        assert_eq!(report.validate_success, 4);
+        assert_eq!(report.validate_failures, 0);
+    });
+
+    let events = ctx.events.lock().unwrap().clone();
+    for i in 0..2 {
+        let tag = |name: &str| format!("{name}-{i}");
+        // 每个任务 preset 恰好执行一次
+        assert_eq!(
+            events.iter().filter(|e| **e == tag("preset")).count(),
+            1,
+            "preset 应每个任务恰好一次: {events:?}"
+        );
+        // preset 必须发生在该任务首次 run 之前
+        let first_run = events.iter().position(|e| *e == tag("run")).unwrap();
+        assert!(
+            events[..first_run].contains(&tag("preset")),
+            "preset 应发生在该任务首次 run 之前: {events:?}"
+        );
+    }
+}
+
+/// preset 返回 Err:任务中止,不进入 run 循环,记一次失败。
+struct PresetFailCtx {
+    ran: Arc<Mutex<bool>>,
+}
+
+#[derive(Default)]
+struct PresetFailScenario;
+
+impl Scenario for PresetFailScenario {
+    type Ctx = PresetFailCtx;
+    type Error = TestError;
+    type Output = ();
+    type Preset = ();
+
+    async fn preset(_ctx: &PresetFailCtx, _task: &TaskIndex) -> Result<(), Self::Error> {
+        Err(TestError)
+    }
+
+    async fn run(ctx: &PresetFailCtx, _task: &TaskIndex, _preset: &()) -> Result<(), Self::Error> {
+        *ctx.ran.lock().unwrap() = true;
+        Ok(())
+    }
+}
+
+register_scenario!(PresetFailScenario);
+
+#[test]
+fn preset_failure_aborts_task_and_counts_one_failure() {
+    let ctx = PresetFailCtx {
+        ran: Arc::new(Mutex::new(false)),
+    };
+    let manager = ScenarioManager::new(ManagerConfig::new(1).with_run_mode(RunMode::Times(3)));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let report = manager
+            .run_one::<PresetFailCtx>("PresetFailScenario", &ctx)
+            .await
+            .expect("scenario should be found");
+        // preset 失败记 1 次失败,run 循环一轮都没执行
+        assert_eq!(report.success, 0);
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.times, 0);
+    });
+
+    assert!(!*ctx.ran.lock().unwrap(), "preset 失败后不应进入 run");
 }
