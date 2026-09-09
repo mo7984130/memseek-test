@@ -1,5 +1,6 @@
 use std::{
     marker::PhantomData,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -17,17 +18,26 @@ pub enum RunMode {
 ///
 /// `index` 为该任务编号(范围 `0..total`);每个并发任务拥有唯一的
 /// `index`,可用它做账号等参数化(`format!("loadtest_{}", index + 1)`)。
+/// `round` 为全局运行编号:preset 阶段从共享计数器取号后,
+/// 该任务内所有轮次的 `run`/`validate` 均携带同一编号,
+/// 可用于全局唯一命名(`format!("data_{}", round)`)或日志定位。
 #[derive(Clone, Copy, Debug)]
 pub struct TaskIndex {
     /// 当前任务编号,范围 `0..total`
     pub index: usize,
     /// 并发任务总数
     pub total: usize,
+    /// 全局运行编号(preset 取号,任务内三阶段共享)
+    pub round: usize,
 }
 
 impl TaskIndex {
-    pub const fn new(index: usize, total: usize) -> Self {
-        Self { index, total }
+    pub const fn new(index: usize, total: usize, round: usize) -> Self {
+        Self {
+            index,
+            total,
+            round,
+        }
     }
 }
 
@@ -37,6 +47,9 @@ pub struct RunnerConfig {
     pub task_index: usize,
     /// 并发任务总数
     pub task_total: usize,
+    /// 全局运行编号计数器(Manager 创建,所有并发任务共享,无锁)。
+    /// preset 阶段取号,该任务内各轮 run/validate 复用同一编号。
+    pub round_counter: std::sync::Arc<AtomicUsize>,
 }
 
 pub struct ScenarioRunner<S> {
@@ -57,7 +70,10 @@ where
     }
 
     pub async fn run(&self, ctx: &S::Ctx) -> Recorder {
-        let task = TaskIndex::new(self.config.task_index, self.config.task_total);
+        // preset 阶段先取号(所有任务共享受共享计数器),
+        // 该任务内各轮 run/validate 复用同一 round。
+        let round = self.config.round_counter.fetch_add(1, Ordering::Relaxed);
+        let task = TaskIndex::new(self.config.task_index, self.config.task_total, round);
         let mut recorder = Recorder::from_config(&self.config);
 
         // preset 阶段:每个任务执行一次,产出注入后续每轮 run/validate。

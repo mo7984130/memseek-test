@@ -424,3 +424,106 @@ fn preset_failure_aborts_task_and_counts_one_failure() {
 
     assert!(!*ctx.ran.lock().unwrap(), "preset 失败后不应进入 run");
 }
+
+/// round(全局运行编号):preset 取号后,该任务内三阶段共享同一编号,且全局唯一。
+struct RoundCtx {
+    records: Arc<Mutex<Vec<(String, String, usize)>>>, // (阶段, 任务, round)
+}
+
+#[derive(Default)]
+struct RoundScenario;
+
+impl Scenario for RoundScenario {
+    type Ctx = RoundCtx;
+    type Error = TestError;
+    type Output = usize;
+    type Preset = String;
+
+    async fn preset(ctx: &RoundCtx, task: &TaskIndex) -> Result<String, Self::Error> {
+        ctx.records
+            .lock()
+            .unwrap()
+            .push(("preset".into(), format!("t{}", task.index), task.round));
+        Ok(format!("r{}", task.round))
+    }
+
+    async fn run(ctx: &RoundCtx, task: &TaskIndex, preset: &String) -> Result<usize, Self::Error> {
+        ctx.records
+            .lock()
+            .unwrap()
+            .push(("run".into(), format!("t{}", task.index), task.round));
+        assert_eq!(preset, &format!("r{}", task.round));
+        Ok(task.round)
+    }
+
+    async fn validate(
+        ctx: &RoundCtx,
+        task: &TaskIndex,
+        _preset: &String,
+        output: &usize,
+    ) -> Result<bool, Self::Error> {
+        ctx.records.lock().unwrap().push((
+            "validate".into(),
+            format!("t{}", task.index),
+            task.round,
+        ));
+        Ok(*output == task.round)
+    }
+}
+
+register_scenario!(RoundScenario);
+
+#[test]
+fn round_is_global_and_shared_across_phases() {
+    let ctx = RoundCtx {
+        records: Arc::new(Mutex::new(Vec::new())),
+    };
+    // 并发 2 × 每任务 2 轮
+    let manager = ScenarioManager::new(ManagerConfig::new(2).with_run_mode(RunMode::Times(4)));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let report = manager
+            .run_one::<RoundCtx>("RoundScenario", &ctx)
+            .await
+            .expect("scenario should be found");
+        assert_eq!(report.success, 4);
+        assert_eq!(report.validate_success, 4);
+    });
+
+    let records = ctx.records.lock().unwrap().clone();
+    let rounds: Vec<usize> = records.iter().map(|r| r.2).collect();
+    // 全局编号:两个任务各取一个,且连续不重复
+    assert_eq!(
+        rounds
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        2
+    );
+    assert!(rounds.iter().all(|r| *r < 2), "rounds = {rounds:?}");
+
+    // 每个任务:preset 恰好 1 次、run 2 次、validate 2 次,三阶段 round 相同
+    for i in 0..2 {
+        let tag = format!("t{i}");
+        let task_events: Vec<_> = records.iter().filter(|(_, t, _)| *t == tag).collect();
+        let phases: Vec<&str> = task_events.iter().map(|e| e.0.as_str()).collect();
+        assert_eq!(phases.iter().filter(|p| **p == "preset").count(), 1);
+        assert_eq!(phases.iter().filter(|p| **p == "run").count(), 2);
+        assert_eq!(phases.iter().filter(|p| **p == "validate").count(), 2);
+        let task_rounds: Vec<usize> = task_events.iter().map(|e| e.2).collect();
+        assert!(
+            task_rounds.iter().all(|r| *r == task_rounds[0]),
+            "任务 {tag} 三阶段 round 应一致: {task_rounds:?}"
+        );
+    }
+
+    // 两个任务取到的是不同的 round(全局唯一)
+    let r0 = records.iter().find(|e| e.1 == "t0").unwrap().2;
+    let r1 = records.iter().find(|e| e.1 == "t1").unwrap().2;
+    assert_ne!(r0, r1);
+}
