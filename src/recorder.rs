@@ -113,7 +113,7 @@ impl Recorder {
         match result {
             Ok(_) => self.success += 1,
             Err(err) => {
-                warn!("{:?}", err);
+                warn!("{err:?}");
                 self.failures += 1;
                 self.error_map
                     .entry(err.kind())

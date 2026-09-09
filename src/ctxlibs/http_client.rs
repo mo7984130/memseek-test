@@ -1,8 +1,38 @@
 use std::borrow::Cow;
 
 use crate::error::ScenarioError;
-use reqwest::{IntoUrl, Response, StatusCode};
+use reqwest::{IntoUrl, Method, Response, StatusCode, Url};
 use serde::ser::Error as _;
+
+/// 请求/响应内容捕获开关。
+///
+/// 值为 `0` 时表示不捕获该侧内容;默认两侧各截断到 512 字符,见 [`CaptureOptions::default`]。
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureOptions {
+    /// 请求体快照最大字符数,`0` 表示不捕获。
+    pub max_request_body: usize,
+    /// 响应体快照最大字符数,`0` 表示不捕获(此时也不会读取响应体)。
+    pub max_response_body: usize,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            max_request_body: 512,
+            max_response_body: 512,
+        }
+    }
+}
+
+impl CaptureOptions {
+    /// 完全不捕获请求/响应内容(高 QPS 场景降低开销)。
+    pub const fn disabled() -> Self {
+        Self {
+            max_request_body: 0,
+            max_response_body: 0,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
@@ -12,14 +42,58 @@ pub enum HttpError {
     Serde(#[from] serde_json::Error),
     #[error("Invalid URL: {0}")]
     Url(#[from] url::ParseError),
-    #[error("HTTP status error: {0}")]
-    Status(reqwest::StatusCode),
+    #[error("HTTP {method} {url} -> {status}")]
+    Status {
+        status: StatusCode,
+        method: Method,
+        url: String,
+        /// 请求体快照(开启捕获时,截断后的文本)。
+        request_body: Option<String>,
+        /// 响应体快照;读取失败时为 `Err(原因)`。开关关闭时为 `None`。
+        response_body: Option<Result<String, String>>,
+    },
 }
 
 impl HttpError {
-    /// 构造状态码错误(供场景对非 2xx 响应使用)。
-    pub fn status(code: StatusCode) -> Self {
-        Self::Status(code)
+    /// 构造带请求上下文的 HTTP 状态码错误(方法 + 完整 URL + 状态码)。
+    ///
+    /// 不带内容快照(业务侧自行构造错误时使用);`Client` 发起请求
+    /// 遇到非 2xx 会自动捕获请求/响应内容,无需手动调用。
+    pub fn status(status: StatusCode, method: Method, url: &Url) -> Self {
+        Self::Status {
+            status,
+            method,
+            url: url.to_string(),
+            request_body: None,
+            response_body: None,
+        }
+    }
+
+    /// 从 `reqwest::Response` 构造:读取响应体快照(开关开启时),
+    /// 读取失败会以 `Err(原因)` 形式保留在 `response_body` 中,不静默丢弃。
+    async fn from_response(
+        resp: Response,
+        method: Method,
+        url: Url,
+        request_body: Option<String>,
+        capture: &CaptureOptions,
+    ) -> Self {
+        let status = resp.status();
+        let response_body = if capture.max_response_body == 0 {
+            None
+        } else {
+            match resp.text().await {
+                Ok(text) => Some(Ok(truncate_log(&text, capture.max_response_body))),
+                Err(err) => Some(Err(err.to_string())),
+            }
+        };
+        Self::Status {
+            status,
+            method,
+            url: url.to_string(),
+            request_body,
+            response_body,
+        }
     }
 }
 
@@ -29,14 +103,25 @@ impl ScenarioError for HttpError {
             Self::Reqwest(_) => "reqwest".into(),
             Self::Serde(_) => "serde".into(),
             Self::Url(_) => "url_parse".into(),
-            Self::Status(code) => format!("http_status_{}", code.as_u16()).into(),
+            Self::Status { status, .. } => format!("http_status_{}", status.as_u16()).into(),
         }
+    }
+}
+
+/// 截断快照到最多 `max` 个字符,超出部分标注原文长度。
+fn truncate_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}...(total {} chars)", s.chars().count())
     }
 }
 
 pub struct Client {
     pub base_url: reqwest::Url,
     inner: reqwest::Client,
+    capture: CaptureOptions,
 }
 
 impl Client {
@@ -44,15 +129,37 @@ impl Client {
         Ok(Self {
             base_url: base_url.into_url()?,
             inner: reqwest::Client::new(),
+            capture: CaptureOptions::default(),
         })
+    }
+
+    /// 链式设置请求/响应内容捕获(默认开启,截断 512 字符;`0` 关闭)。
+    pub fn with_capture(mut self, capture: CaptureOptions) -> Self {
+        self.capture = capture;
+        self
+    }
+
+    /// 请求体快照(开关开启时),否则 `None`。
+    fn capture_body(&self, bytes: &[u8]) -> Option<String> {
+        if self.capture.max_request_body == 0 {
+            None
+        } else {
+            Some(truncate_log(
+                &String::from_utf8_lossy(bytes),
+                self.capture.max_request_body,
+            ))
+        }
     }
 
     /// GET 请求:状态码非 200 时直接返回 `HttpError::Status`(压测默认行为)。
     /// 需要读取非 200 响应体时,用 [`Self::get_raw`]。
     pub async fn get(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.get_raw(url).await?;
+        let url = self.base_url.join(url)?;
+        let resp = self.inner.get(url.clone()).send().await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(
+                HttpError::from_response(resp, Method::GET, url, None, &self.capture).await,
+            );
         }
         Ok(resp)
     }
@@ -70,9 +177,25 @@ impl Client {
         url: &str,
         body: impl serde::Serialize,
     ) -> Result<Response, HttpError> {
-        let resp = self.post_raw(url, &body).await?;
+        let url = self.base_url.join(url)?;
+        let bytes = serde_json::to_vec(&body)?;
+        let request_body = self.capture_body(&bytes);
+        let resp = self
+            .inner
+            .post(url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes)
+            .send()
+            .await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(HttpError::from_response(
+                resp,
+                Method::POST,
+                url,
+                request_body,
+                &self.capture,
+            )
+            .await);
         }
         Ok(resp)
     }
@@ -98,14 +221,29 @@ impl Client {
         url: &str,
         form: &[(String, String)],
     ) -> Result<Response, HttpError> {
+        let url = self.base_url.join(url)?;
+        let encoded = serde_urlencoded::to_string(form)
+            .map_err(|e| serde_json::Error::custom(e.to_string()))?;
+        let request_body = self.capture_body(encoded.as_bytes());
         let resp = self
             .inner
-            .post(self.base_url.join(url)?)
-            .form(form)
+            .post(url.clone())
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(encoded)
             .send()
             .await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(HttpError::from_response(
+                resp,
+                Method::POST,
+                url,
+                request_body,
+                &self.capture,
+            )
+            .await);
         }
         Ok(resp)
     }
@@ -113,9 +251,25 @@ impl Client {
     /// PUT 请求:状态码非 200 时返回错误。
     /// `body` 接受任意 `Serialize` 值(如 `json!({...})` 或 `&Struct`)。
     pub async fn put(&self, url: &str, body: impl serde::Serialize) -> Result<Response, HttpError> {
-        let resp = self.put_raw(url, &body).await?;
+        let url = self.base_url.join(url)?;
+        let bytes = serde_json::to_vec(&body)?;
+        let request_body = self.capture_body(&bytes);
+        let resp = self
+            .inner
+            .put(url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes)
+            .send()
+            .await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(HttpError::from_response(
+                resp,
+                Method::PUT,
+                url,
+                request_body,
+                &self.capture,
+            )
+            .await);
         }
         Ok(resp)
     }
@@ -137,9 +291,12 @@ impl Client {
 
     /// DELETE 请求:状态码非 200 时返回错误。
     pub async fn delete(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.delete_raw(url).await?;
+        let url = self.base_url.join(url)?;
+        let resp = self.inner.delete(url.clone()).send().await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(
+                HttpError::from_response(resp, Method::DELETE, url, None, &self.capture).await,
+            );
         }
         Ok(resp)
     }
@@ -157,9 +314,25 @@ impl Client {
         url: &str,
         body: impl serde::Serialize,
     ) -> Result<Response, HttpError> {
-        let resp = self.patch_raw(url, &body).await?;
+        let url = self.base_url.join(url)?;
+        let bytes = serde_json::to_vec(&body)?;
+        let request_body = self.capture_body(&bytes);
+        let resp = self
+            .inner
+            .patch(url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes)
+            .send()
+            .await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(HttpError::from_response(
+                resp,
+                Method::PATCH,
+                url,
+                request_body,
+                &self.capture,
+            )
+            .await);
         }
         Ok(resp)
     }
@@ -181,9 +354,16 @@ impl Client {
 
     /// OPTIONS 请求:状态码非 200 时返回错误。
     pub async fn options(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.options_raw(url).await?;
+        let url = self.base_url.join(url)?;
+        let resp = self
+            .inner
+            .request(Method::OPTIONS, url.clone())
+            .send()
+            .await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(
+                HttpError::from_response(resp, Method::OPTIONS, url, None, &self.capture).await,
+            );
         }
         Ok(resp)
     }
@@ -200,9 +380,12 @@ impl Client {
 
     /// HEAD 请求:状态码非 200 时返回错误。
     pub async fn head(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.head_raw(url).await?;
+        let url = self.base_url.join(url)?;
+        let resp = self.inner.head(url.clone()).send().await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(
+                HttpError::from_response(resp, Method::HEAD, url, None, &self.capture).await,
+            );
         }
         Ok(resp)
     }
@@ -227,6 +410,7 @@ pub struct RequestBuilder<'a> {
     body: Option<reqwest::Body>,
     headers: reqwest::header::HeaderMap,
     query: Vec<(String, String)>,
+    body_snapshot: Option<String>,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -238,6 +422,7 @@ impl<'a> RequestBuilder<'a> {
             body: None,
             headers: reqwest::header::HeaderMap::new(),
             query: Vec::new(),
+            body_snapshot: None,
         }
     }
 
@@ -263,6 +448,7 @@ impl<'a> RequestBuilder<'a> {
     /// 设置 JSON body
     pub fn json<B: serde::Serialize>(mut self, body: &B) -> Result<Self, serde_json::Error> {
         let bytes = serde_json::to_vec(body)?;
+        self.body_snapshot = self.client.capture_body(&bytes);
         self.body = Some(reqwest::Body::from(bytes));
         self.headers.insert(
             reqwest::header::CONTENT_TYPE,
@@ -283,10 +469,10 @@ impl<'a> RequestBuilder<'a> {
 
     /// 设置表单数据
     pub fn form<B: serde::Serialize>(mut self, form: &B) -> Result<Self, serde_json::Error> {
-        let bytes = serde_urlencoded::to_string(form)
-            .map_err(|e| serde_json::Error::custom(e.to_string()))?
-            .into_bytes();
-        self.body = Some(reqwest::Body::from(bytes));
+        let encoded = serde_urlencoded::to_string(form)
+            .map_err(|e| serde_json::Error::custom(e.to_string()))?;
+        self.body_snapshot = self.client.capture_body(encoded.as_bytes());
+        self.body = Some(reqwest::Body::from(encoded.into_bytes()));
         self.headers.insert(
             reqwest::header::CONTENT_TYPE,
             reqwest::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
@@ -294,38 +480,81 @@ impl<'a> RequestBuilder<'a> {
         Ok(self)
     }
 
-    pub async fn send(self) -> Result<Response, HttpError> {
-        let mut req_builder = self
-            .client
-            .inner
-            .request(self.method, self.client.base_url.join(&self.url)?);
+    /// 统一的发送实现:解析完整 URL 并发起请求。
+    async fn send_impl(
+        client: &Client,
+        method: reqwest::Method,
+        full_url: Url,
+        headers: reqwest::header::HeaderMap,
+        query: Vec<(String, String)>,
+        body: Option<reqwest::Body>,
+    ) -> Result<Response, HttpError> {
+        let mut req_builder = client.inner.request(method, full_url);
 
         // 添加 headers
-        for (key, value) in self.headers {
+        for (key, value) in headers {
             if let Some(key) = key {
                 req_builder = req_builder.header(key, value);
             }
         }
 
         // 添加 query 参数
-        if !self.query.is_empty() {
-            req_builder = req_builder.query(&self.query);
+        if !query.is_empty() {
+            req_builder = req_builder.query(&query);
         }
 
         // 添加 body
-        if let Some(body) = self.body {
+        if let Some(body) = body {
             req_builder = req_builder.body(body);
         }
 
-        let resp = req_builder.send().await?;
-        Ok(resp)
+        req_builder.send().await.map_err(HttpError::from)
     }
 
-    /// 发送请求并自动检查状态码
+    pub async fn send(self) -> Result<Response, HttpError> {
+        let RequestBuilder {
+            client,
+            method,
+            url: path,
+            body,
+            headers,
+            query,
+            body_snapshot: _,
+        } = self;
+        let full_url = client.base_url.join(&path)?;
+        Self::send_impl(client, method, full_url, headers, query, body).await
+    }
+
+    /// 发送请求并自动检查状态码(自动捕获请求/响应内容快照)
     pub async fn send_checked(self) -> Result<Response, HttpError> {
-        let resp = self.send().await?;
+        let RequestBuilder {
+            client,
+            method,
+            url: path,
+            body,
+            headers,
+            query,
+            body_snapshot,
+        } = self;
+        let full_url = client.base_url.join(&path)?;
+        let resp = Self::send_impl(
+            client,
+            method.clone(),
+            full_url.clone(),
+            headers,
+            query,
+            body,
+        )
+        .await?;
         if resp.status() != StatusCode::OK {
-            return Err(HttpError::Status(resp.status()));
+            return Err(HttpError::from_response(
+                resp,
+                method,
+                full_url,
+                body_snapshot,
+                &client.capture,
+            )
+            .await);
         }
         Ok(resp)
     }

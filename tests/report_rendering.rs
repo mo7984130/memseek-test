@@ -72,6 +72,10 @@ fn vec_report_has_summary_and_table() {
     assert!(text.contains("login"));
     assert!(text.contains("order"));
     assert!(text.contains("Per-scenario"));
+    // 汇总带 validate 统计与错误类型明细
+    assert!(text.contains("Validate  : 1398 ok / 102 fail"));
+    assert!(text.contains("Errors"));
+    assert!(text.contains("timeout"));
 }
 
 #[test]

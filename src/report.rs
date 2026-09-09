@@ -247,6 +247,8 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     let total_times: u64 = reports.iter().map(|r| r.times).sum();
     let total_success: u64 = reports.iter().map(|r| r.success).sum();
     let total_failures: u64 = reports.iter().map(|r| r.failures).sum();
+    let total_validate_success: u64 = reports.iter().map(|r| r.validate_success).sum();
+    let total_validate_failures: u64 = reports.iter().map(|r| r.validate_failures).sum();
     let total_total: Duration = reports.iter().map(|r| r.total).sum();
     let avg: Duration = if total_times > 0 {
         let num: u128 = reports
@@ -280,6 +282,12 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     writeln!(out, "Failures  : {}", total_failures).unwrap();
     writeln!(
         out,
+        "Validate  : {} ok / {} fail",
+        total_validate_success, total_validate_failures,
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Overall   : {} {}",
         bar(total_rate, o.bar_width),
         paint(rate_label(total_rate), rate_color(total_rate), o.color),
@@ -298,7 +306,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         .max(4);
 
     let header = format!(
-        "{:<name_w$} {:>8} {:>10} {:>10} {:>8} {:>10} {:>10}",
+        "{:<name_w$} {:>8} {:>10} {:>10} {:>8} {:>10} {:>10} {:>12}",
         "Name",
         "Times",
         "Success",
@@ -306,6 +314,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         "Rate",
         "Avg",
         "P95",
+        "Validate",
         name_w = name_w,
     );
     writeln!(out, "{}", paint(&header, "36", o.color)).unwrap();
@@ -314,7 +323,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         let rate = rate_of(r.success, r.times);
         writeln!(
             out,
-            "{:<name_w$} {:>8} {:>10} {:>10} {:>8} {:>10} {:>10}",
+            "{:<name_w$} {:>8} {:>10} {:>10} {:>8} {:>10} {:>10} {:>12}",
             r.name,
             r.times,
             r.success,
@@ -322,9 +331,37 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
             format!("{:.1}%", rate * 100.0),
             fmt_duration(r.avg),
             fmt_duration(r.p95),
+            format!("{}/{}", r.validate_success, r.validate_failures),
             name_w = name_w,
         )
         .unwrap();
+    }
+
+    // ---- 错误明细 ----
+    let err_rows: Vec<_> = reports.iter().filter(|r| !r.error_map.is_empty()).collect();
+    if !err_rows.is_empty() {
+        writeln!(out).unwrap();
+        writeln!(out, "{}", paint("---- Errors ----", "1;36", o.color)).unwrap();
+
+        for r in err_rows {
+            writeln!(out, "{}", paint(&format!("  {}.", r.name), "1", o.color)).unwrap();
+
+            let mut errs: Vec<_> = r.error_map.iter().collect();
+            errs.sort_by(|a, b| b.1.cmp(a.1));
+            let denom = r.failures.max(1) as f64;
+            for (kind, count) in errs {
+                let frac = *count as f64 / denom;
+                writeln!(
+                    out,
+                    "    {:<24} {} {} ({:.1}%)",
+                    kind,
+                    bar(frac, o.bar_width),
+                    count,
+                    frac * 100.0,
+                )
+                .unwrap();
+            }
+        }
     }
 
     out

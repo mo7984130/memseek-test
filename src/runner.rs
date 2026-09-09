@@ -132,7 +132,7 @@ where
                 recorder.record_validate(validated);
             }
             Err(err) => {
-                warn!("{:#?}", err);
+                warn!("{err:?}");
                 recorder.record_validate(false);
             }
         }
