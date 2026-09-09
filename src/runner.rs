@@ -1,12 +1,15 @@
 use std::{
     marker::PhantomData,
-    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
 use tracing::warn;
 
-use crate::{error::ScenarioError, recorder::Recorder, scenario::Scenario};
+use crate::{
+    error::ScenarioError,
+    recorder::Recorder,
+    scenario::{Scenario, SetupMode},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum RunMode {
@@ -18,8 +21,8 @@ pub enum RunMode {
 ///
 /// `index` 为该任务编号(范围 `0..total`);每个并发任务拥有唯一的
 /// `index`,可用它做账号等参数化(`format!("loadtest_{}", index + 1)`)。
-/// `round` 为全局运行编号:preset 阶段从共享计数器取号后,
-/// 该任务内所有轮次的 `run`/`validate` 均携带同一编号,
+/// `round` 为全局运行编号:每次执行(含 `setup`)从共享计数器取号,
+/// 同一轮内的 `setup`/`run`/`validate` 携带同一编号,
 /// 可用于全局唯一命名(`format!("data_{}", round)`)或日志定位。
 #[derive(Clone, Copy, Debug)]
 pub struct TaskIndex {
@@ -27,7 +30,7 @@ pub struct TaskIndex {
     pub index: usize,
     /// 并发任务总数
     pub total: usize,
-    /// 全局运行编号(preset 取号,任务内三阶段共享)
+    /// 全局运行编号(本轮编号,每轮递增)
     pub round: usize,
 }
 
@@ -47,9 +50,6 @@ pub struct RunnerConfig {
     pub task_index: usize,
     /// 并发任务总数
     pub task_total: usize,
-    /// 全局运行编号计数器(Manager 创建,所有并发任务共享,无锁)。
-    /// preset 阶段取号,该任务内各轮 run/validate 复用同一编号。
-    pub round_counter: std::sync::Arc<AtomicUsize>,
 }
 
 pub struct ScenarioRunner<S> {
@@ -69,51 +69,113 @@ where
         }
     }
 
+    /// 执行并记录一轮 `run`,成功时进入 `validate`。
+    async fn run_and_validate(
+        ctx: &S::Ctx,
+        task: &TaskIndex,
+        setup: &S::Setup,
+        recorder: &mut Recorder,
+    ) {
+        let result = Self::once(ctx, task, setup, recorder).await;
+        // run 失败已记录,不再进入 validate
+        if let Ok(output) = &result {
+            Self::validate(ctx, task, setup, output, recorder).await;
+        }
+    }
+
     pub async fn run(&self, ctx: &S::Ctx) -> Recorder {
-        // preset 阶段先取号(所有任务共享受共享计数器),
-        // 该任务内各轮 run/validate 复用同一 round。
-        let round = self.config.round_counter.fetch_add(1, Ordering::Relaxed);
-        let task = TaskIndex::new(self.config.task_index, self.config.task_total, round);
         let mut recorder = Recorder::from_config(&self.config);
 
-        // preset 阶段:每个任务执行一次,产出注入后续每轮 run/validate。
-        // 失败时该任务直接中止,记一次失败,不计入耗时分布。
-        let preset = match S::preset(ctx, &task).await {
-            Ok(preset) => preset,
-            Err(err) => {
-                recorder.record_result(&Err::<(), S::Error>(err));
-                return recorder;
-            }
-        };
+        match S::SETUP_MODE {
+            SetupMode::Task => {
+                // setup 任务级一次(round 无轮次含义,固定 0),产出供各轮复用
+                let setup_task = TaskIndex::new(self.config.task_index, self.config.task_total, 0);
+                let setup = match S::setup(ctx, &setup_task).await {
+                    Ok(setup) => setup,
+                    Err(err) => {
+                        recorder.record_result(&Err::<(), S::Error>(err));
+                        return recorder;
+                    }
+                };
+                match self.config.mode {
+                    RunMode::Times(times) => {
+                        for round in 0..times {
+                            let task = TaskIndex::new(
+                                self.config.task_index,
+                                self.config.task_total,
+                                round as usize,
+                            );
+                            Self::run_and_validate(ctx, &task, &setup, &mut recorder).await;
+                        }
+                    }
+                    RunMode::Duration(duration) => {
+                        let mut remaining = duration;
+                        let mut round = 0usize;
 
-        match self.config.mode {
-            RunMode::Times(times) => {
-                for _ in 0..times {
-                    let result = Self::once(ctx, &task, &preset, &mut recorder).await;
-                    // run 失败已记录,不再进入 validate
-                    if let Ok(output) = &result {
-                        Self::validate(ctx, &task, &preset, output, &mut recorder).await;
+                        while !remaining.is_zero() {
+                            let start = Instant::now();
+                            let task = TaskIndex::new(
+                                self.config.task_index,
+                                self.config.task_total,
+                                round,
+                            );
+                            round += 1;
+
+                            Self::run_and_validate(ctx, &task, &setup, &mut recorder).await;
+
+                            remaining = remaining.saturating_sub(start.elapsed());
+                        }
                     }
                 }
             }
-            RunMode::Duration(duration) => {
-                let mut remaining = duration;
+            SetupMode::Round => {
+                // setup 每轮一次:失败则记一次失败并中止任务
+                match self.config.mode {
+                    RunMode::Times(times) => {
+                        for round in 0..times {
+                            let task = TaskIndex::new(
+                                self.config.task_index,
+                                self.config.task_total,
+                                round as usize,
+                            );
+                            let setup = match S::setup(ctx, &task).await {
+                                Ok(setup) => setup,
+                                Err(err) => {
+                                    recorder.record_result(&Err::<(), S::Error>(err));
+                                    return recorder;
+                                }
+                            };
+                            Self::run_and_validate(ctx, &task, &setup, &mut recorder).await;
+                        }
+                    }
+                    RunMode::Duration(duration) => {
+                        let mut remaining = duration;
+                        let mut round = 0usize;
 
-                while !remaining.is_zero() {
-                    let start = Instant::now();
+                        while !remaining.is_zero() {
+                            let start = Instant::now();
+                            let task = TaskIndex::new(
+                                self.config.task_index,
+                                self.config.task_total,
+                                round,
+                            );
+                            round += 1;
+                            let setup = match S::setup(ctx, &task).await {
+                                Ok(setup) => setup,
+                                Err(err) => {
+                                    recorder.record_result(&Err::<(), S::Error>(err));
+                                    return recorder;
+                                }
+                            };
 
-                    let result = Self::once(ctx, &task, &preset, &mut recorder).await;
+                            Self::run_and_validate(ctx, &task, &setup, &mut recorder).await;
 
-                    let elapsed = start.elapsed();
-                    remaining = remaining.saturating_sub(elapsed);
-
-                    // run 失败已记录,不再进入 validate
-                    if let Ok(output) = &result {
-                        Self::validate(ctx, &task, &preset, output, &mut recorder).await;
+                            remaining = remaining.saturating_sub(start.elapsed());
+                        }
                     }
                 }
             }
-        };
+        }
 
         recorder
     }
@@ -123,11 +185,11 @@ where
     async fn once(
         ctx: &S::Ctx,
         task: &TaskIndex,
-        preset: &S::Preset,
+        setup: &S::Setup,
         recorder: &mut Recorder,
     ) -> Result<S::Output, S::Error> {
         let start = Instant::now();
-        let result = S::run(ctx, task, preset).await;
+        let result = S::run(ctx, task, setup).await;
 
         recorder.record_duration(start.elapsed());
         recorder.record_result(&result);
@@ -138,11 +200,11 @@ where
     async fn validate(
         ctx: &S::Ctx,
         task: &TaskIndex,
-        preset: &S::Preset,
+        setup: &S::Setup,
         output: &S::Output,
         recorder: &mut Recorder,
     ) {
-        let ret = S::validate(ctx, task, preset, output).await;
+        let ret = S::validate(ctx, task, setup, output).await;
         match ret {
             Ok(validated) => {
                 recorder.record_validate(validated);

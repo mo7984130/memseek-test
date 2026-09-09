@@ -9,7 +9,7 @@ use memseek_test::{
     manager::{ManagerConfig, ScenarioManager},
     register_scenario,
     registry::ScenarioRegistry,
-    scenario::Scenario,
+    scenario::{Scenario, SetupMode},
 };
 
 #[derive(Debug)]
@@ -31,9 +31,9 @@ impl Scenario for HelloScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = ();
-    type Preset = ();
+    type Setup = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _setup: &()) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -49,9 +49,9 @@ impl Scenario for NamedScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = ();
-    type Preset = ();
+    type Setup = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _setup: &()) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -70,16 +70,16 @@ impl Scenario for OutputScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = u32;
-    type Preset = ();
+    type Setup = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<u32, Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _setup: &()) -> Result<u32, Self::Error> {
         Ok(42)
     }
 
     async fn validate(
         _ctx: &AuthContext,
         _task: &TaskIndex,
-        _preset: &(),
+        _setup: &(),
         output: &u32,
     ) -> Result<bool, Self::Error> {
         Ok(*output == 42)
@@ -149,9 +149,9 @@ impl Scenario for FailingScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = ();
-    type Preset = ();
+    type Setup = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<(), Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _setup: &()) -> Result<(), Self::Error> {
         Err(TestError)
     }
 }
@@ -188,16 +188,16 @@ impl Scenario for BadOutputScenario {
     type Ctx = AuthContext;
     type Error = TestError;
     type Output = u32;
-    type Preset = ();
+    type Setup = ();
 
-    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _preset: &()) -> Result<u32, Self::Error> {
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _setup: &()) -> Result<u32, Self::Error> {
         Ok(43)
     }
 
     async fn validate(
         _ctx: &AuthContext,
         _task: &TaskIndex,
-        _preset: &(),
+        _setup: &(),
         output: &u32,
     ) -> Result<bool, Self::Error> {
         Ok(*output == 42)
@@ -239,9 +239,9 @@ impl Scenario for IndexScenario {
     type Ctx = IndexCtx;
     type Error = TestError;
     type Output = usize;
-    type Preset = ();
+    type Setup = ();
 
-    async fn run(ctx: &Self::Ctx, task: &TaskIndex, _preset: &()) -> Result<usize, Self::Error> {
+    async fn run(ctx: &Self::Ctx, task: &TaskIndex, _setup: &()) -> Result<usize, Self::Error> {
         ctx.seen.lock().unwrap().push(task.index);
         Ok(task.index)
     }
@@ -249,7 +249,7 @@ impl Scenario for IndexScenario {
     async fn validate(
         _ctx: &Self::Ctx,
         task: &TaskIndex,
-        _preset: &(),
+        _setup: &(),
         output: &usize,
     ) -> Result<bool, Self::Error> {
         Ok(*output == task.index)
@@ -284,59 +284,55 @@ fn task_index_is_assigned_per_concurrent_task() {
     assert_eq!(seen, vec![0, 1, 2, 3]);
 }
 
-/// preset 阶段:每个任务执行一次,产出注入每轮 run/validate。
-struct PresetCtx {
+/// setup 阶段:每个任务执行一次,产出注入每轮 run/validate。
+struct SetupCtx {
     events: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Default)]
-struct PresetScenario;
+struct SetupScenario;
 
-impl Scenario for PresetScenario {
-    type Ctx = PresetCtx;
+impl Scenario for SetupScenario {
+    type Ctx = SetupCtx;
     type Error = TestError;
     type Output = String;
-    type Preset = String;
+    type Setup = String;
 
-    async fn preset(ctx: &PresetCtx, task: &TaskIndex) -> Result<String, Self::Error> {
+    async fn setup(ctx: &SetupCtx, task: &TaskIndex) -> Result<String, Self::Error> {
         ctx.events
             .lock()
             .unwrap()
-            .push(format!("preset-{}", task.index));
+            .push(format!("setup-{}", task.index));
         Ok(format!("token-{}", task.index))
     }
 
-    async fn run(
-        ctx: &PresetCtx,
-        task: &TaskIndex,
-        preset: &String,
-    ) -> Result<String, Self::Error> {
+    async fn run(ctx: &SetupCtx, task: &TaskIndex, setup: &String) -> Result<String, Self::Error> {
         ctx.events
             .lock()
             .unwrap()
             .push(format!("run-{}", task.index));
-        Ok(format!("{}-{}", preset, task.index))
+        Ok(format!("{}-{}", setup, task.index))
     }
 
     async fn validate(
-        ctx: &PresetCtx,
+        ctx: &SetupCtx,
         task: &TaskIndex,
-        preset: &String,
+        setup: &String,
         output: &String,
     ) -> Result<bool, Self::Error> {
         ctx.events
             .lock()
             .unwrap()
             .push(format!("validate-{}", task.index));
-        Ok(output == &format!("{}-{}", preset, task.index))
+        Ok(output == &format!("{}-{}", setup, task.index))
     }
 }
 
-register_scenario!(PresetScenario);
+register_scenario!(SetupScenario);
 
 #[test]
-fn preset_runs_once_before_each_task_and_feeds_run() {
-    let ctx = PresetCtx {
+fn setup_runs_once_before_each_task_and_feeds_run() {
+    let ctx = SetupCtx {
         events: Arc::new(Mutex::new(Vec::new())),
     };
     let manager = ScenarioManager::new(ManagerConfig::new(2).with_run_mode(RunMode::Times(4)));
@@ -347,10 +343,10 @@ fn preset_runs_once_before_each_task_and_feeds_run() {
         .unwrap();
     rt.block_on(async {
         let report = manager
-            .run_one::<PresetCtx>("PresetScenario", &ctx)
+            .run_one::<SetupCtx>("SetupScenario", &ctx)
             .await
             .expect("scenario should be found");
-        // run 每轮都拿到了 preset 注入的 token,validate 断言全部通过
+        // run 每轮都拿到了 setup 注入的 token,validate 断言全部通过
         assert_eq!(report.success, 4);
         assert_eq!(report.validate_success, 4);
         assert_eq!(report.validate_failures, 0);
@@ -359,50 +355,50 @@ fn preset_runs_once_before_each_task_and_feeds_run() {
     let events = ctx.events.lock().unwrap().clone();
     for i in 0..2 {
         let tag = |name: &str| format!("{name}-{i}");
-        // 每个任务 preset 恰好执行一次
+        // 每个任务 setup 恰好执行一次
         assert_eq!(
-            events.iter().filter(|e| **e == tag("preset")).count(),
+            events.iter().filter(|e| **e == tag("setup")).count(),
             1,
-            "preset 应每个任务恰好一次: {events:?}"
+            "setup 应每个任务恰好一次: {events:?}"
         );
-        // preset 必须发生在该任务首次 run 之前
+        // setup 必须发生在该任务首次 run 之前
         let first_run = events.iter().position(|e| *e == tag("run")).unwrap();
         assert!(
-            events[..first_run].contains(&tag("preset")),
-            "preset 应发生在该任务首次 run 之前: {events:?}"
+            events[..first_run].contains(&tag("setup")),
+            "setup 应发生在该任务首次 run 之前: {events:?}"
         );
     }
 }
 
-/// preset 返回 Err:任务中止,不进入 run 循环,记一次失败。
-struct PresetFailCtx {
+/// setup 返回 Err:任务中止,不进入 run 循环,记一次失败。
+struct SetupFailCtx {
     ran: Arc<Mutex<bool>>,
 }
 
 #[derive(Default)]
-struct PresetFailScenario;
+struct SetupFailScenario;
 
-impl Scenario for PresetFailScenario {
-    type Ctx = PresetFailCtx;
+impl Scenario for SetupFailScenario {
+    type Ctx = SetupFailCtx;
     type Error = TestError;
     type Output = ();
-    type Preset = ();
+    type Setup = ();
 
-    async fn preset(_ctx: &PresetFailCtx, _task: &TaskIndex) -> Result<(), Self::Error> {
+    async fn setup(_ctx: &SetupFailCtx, _task: &TaskIndex) -> Result<(), Self::Error> {
         Err(TestError)
     }
 
-    async fn run(ctx: &PresetFailCtx, _task: &TaskIndex, _preset: &()) -> Result<(), Self::Error> {
+    async fn run(ctx: &SetupFailCtx, _task: &TaskIndex, _setup: &()) -> Result<(), Self::Error> {
         *ctx.ran.lock().unwrap() = true;
         Ok(())
     }
 }
 
-register_scenario!(PresetFailScenario);
+register_scenario!(SetupFailScenario);
 
 #[test]
-fn preset_failure_aborts_task_and_counts_one_failure() {
-    let ctx = PresetFailCtx {
+fn setup_failure_aborts_task_and_counts_one_failure() {
+    let ctx = SetupFailCtx {
         ran: Arc::new(Mutex::new(false)),
     };
     let manager = ScenarioManager::new(ManagerConfig::new(1).with_run_mode(RunMode::Times(3)));
@@ -413,53 +409,53 @@ fn preset_failure_aborts_task_and_counts_one_failure() {
         .unwrap();
     rt.block_on(async {
         let report = manager
-            .run_one::<PresetFailCtx>("PresetFailScenario", &ctx)
+            .run_one::<SetupFailCtx>("SetupFailScenario", &ctx)
             .await
             .expect("scenario should be found");
-        // preset 失败记 1 次失败,run 循环一轮都没执行
+        // setup 失败记 1 次失败,run 循环一轮都没执行
         assert_eq!(report.success, 0);
         assert_eq!(report.failures, 1);
         assert_eq!(report.times, 0);
     });
 
-    assert!(!*ctx.ran.lock().unwrap(), "preset 失败后不应进入 run");
+    assert!(!*ctx.ran.lock().unwrap(), "setup 失败后不应进入 run");
 }
 
-/// round(全局运行编号):preset 取号后,该任务内三阶段共享同一编号,且全局唯一。
+/// round(全局运行编号):每次执行(setup/run)取号,编号全局连续唯一。
 struct RoundCtx {
     records: Arc<Mutex<Vec<(String, String, usize)>>>, // (阶段, 任务, round)
 }
 
+/// Task 模式(默认):setup 每任务一次,每轮 run 独立取号。
 #[derive(Default)]
-struct RoundScenario;
+struct TaskModeScenario;
 
-impl Scenario for RoundScenario {
+impl Scenario for TaskModeScenario {
     type Ctx = RoundCtx;
     type Error = TestError;
     type Output = usize;
-    type Preset = String;
+    type Setup = String;
 
-    async fn preset(ctx: &RoundCtx, task: &TaskIndex) -> Result<String, Self::Error> {
+    async fn setup(ctx: &RoundCtx, task: &TaskIndex) -> Result<String, Self::Error> {
         ctx.records
             .lock()
             .unwrap()
-            .push(("preset".into(), format!("t{}", task.index), task.round));
+            .push(("setup".into(), format!("t{}", task.index), task.round));
         Ok(format!("r{}", task.round))
     }
 
-    async fn run(ctx: &RoundCtx, task: &TaskIndex, preset: &String) -> Result<usize, Self::Error> {
+    async fn run(ctx: &RoundCtx, task: &TaskIndex, _setup: &String) -> Result<usize, Self::Error> {
         ctx.records
             .lock()
             .unwrap()
             .push(("run".into(), format!("t{}", task.index), task.round));
-        assert_eq!(preset, &format!("r{}", task.round));
         Ok(task.round)
     }
 
     async fn validate(
         ctx: &RoundCtx,
         task: &TaskIndex,
-        _preset: &String,
+        _setup: &String,
         output: &usize,
     ) -> Result<bool, Self::Error> {
         ctx.records.lock().unwrap().push((
@@ -471,14 +467,14 @@ impl Scenario for RoundScenario {
     }
 }
 
-register_scenario!(RoundScenario);
+register_scenario!(TaskModeScenario);
 
 #[test]
-fn round_is_global_and_shared_across_phases() {
+fn task_mode_takes_one_round_per_run() {
     let ctx = RoundCtx {
         records: Arc::new(Mutex::new(Vec::new())),
     };
-    // 并发 2 × 每任务 2 轮
+    // 并发 2 × 每任务 2 轮:round 为任务内轮次计数(0,1)
     let manager = ScenarioManager::new(ManagerConfig::new(2).with_run_mode(RunMode::Times(4)));
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -487,7 +483,7 @@ fn round_is_global_and_shared_across_phases() {
         .unwrap();
     rt.block_on(async {
         let report = manager
-            .run_one::<RoundCtx>("RoundScenario", &ctx)
+            .run_one::<RoundCtx>("TaskModeScenario", &ctx)
             .await
             .expect("scenario should be found");
         assert_eq!(report.success, 4);
@@ -495,35 +491,122 @@ fn round_is_global_and_shared_across_phases() {
     });
 
     let records = ctx.records.lock().unwrap().clone();
-    let rounds: Vec<usize> = records.iter().map(|r| r.2).collect();
-    // 全局编号:两个任务各取一个,且连续不重复
-    assert_eq!(
-        rounds
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        2
-    );
-    assert!(rounds.iter().all(|r| *r < 2), "rounds = {rounds:?}");
 
-    // 每个任务:preset 恰好 1 次、run 2 次、validate 2 次,三阶段 round 相同
+    // setup 每任务恰 1 次,round 固定 0(无轮次含义)
+    let setups: Vec<_> = records.iter().filter(|e| e.0 == "setup").collect();
+    assert_eq!(setups.len(), 2, "records = {records:?}");
+    assert!(
+        setups.iter().all(|e| e.2 == 0),
+        "setup round 应为 0: {records:?}"
+    );
+
+    // 每任务 2 轮:run/validate 同号成对,round 为 0,1
     for i in 0..2 {
         let tag = format!("t{i}");
-        let task_events: Vec<_> = records.iter().filter(|(_, t, _)| *t == tag).collect();
-        let phases: Vec<&str> = task_events.iter().map(|e| e.0.as_str()).collect();
-        assert_eq!(phases.iter().filter(|p| **p == "preset").count(), 1);
-        assert_eq!(phases.iter().filter(|p| **p == "run").count(), 2);
-        assert_eq!(phases.iter().filter(|p| **p == "validate").count(), 2);
-        let task_rounds: Vec<usize> = task_events.iter().map(|e| e.2).collect();
-        assert!(
-            task_rounds.iter().all(|r| *r == task_rounds[0]),
-            "任务 {tag} 三阶段 round 应一致: {task_rounds:?}"
-        );
+        let ev: Vec<_> = records.iter().filter(|(_, t, _)| *t == tag).collect();
+        assert_eq!(ev.iter().filter(|e| e.0 == "run").count(), 2);
+        assert_eq!(ev.iter().filter(|e| e.0 == "validate").count(), 2);
+        for round in 0..2 {
+            assert_eq!(
+                ev.iter().filter(|e| e.0 == "run" && e.2 == round).count(),
+                1,
+                "任务 {tag} round {round} 的 run 应恰 1 次: {records:?}"
+            );
+            assert_eq!(
+                ev.iter()
+                    .filter(|e| e.0 == "validate" && e.2 == round)
+                    .count(),
+                1,
+                "任务 {tag} round {round} 的 validate 应恰 1 次: {records:?}"
+            );
+        }
+    }
+}
+
+/// Round 模式:setup 每轮执行,与该轮 run/validate 同一编号。
+#[derive(Default)]
+struct RoundSetupScenario;
+
+impl Scenario for RoundSetupScenario {
+    type Ctx = RoundCtx;
+    type Error = TestError;
+    type Output = usize;
+    type Setup = String;
+
+    const SETUP_MODE: SetupMode = SetupMode::Round;
+
+    async fn setup(ctx: &RoundCtx, task: &TaskIndex) -> Result<String, Self::Error> {
+        ctx.records
+            .lock()
+            .unwrap()
+            .push(("setup".into(), format!("t{}", task.index), task.round));
+        Ok(format!("r{}", task.round))
     }
 
-    // 两个任务取到的是不同的 round(全局唯一)
-    let r0 = records.iter().find(|e| e.1 == "t0").unwrap().2;
-    let r1 = records.iter().find(|e| e.1 == "t1").unwrap().2;
-    assert_ne!(r0, r1);
+    async fn run(ctx: &RoundCtx, task: &TaskIndex, setup: &String) -> Result<usize, Self::Error> {
+        ctx.records
+            .lock()
+            .unwrap()
+            .push(("run".into(), format!("t{}", task.index), task.round));
+        assert_eq!(setup, &format!("r{}", task.round));
+        Ok(task.round)
+    }
+
+    async fn validate(
+        ctx: &RoundCtx,
+        task: &TaskIndex,
+        _setup: &String,
+        output: &usize,
+    ) -> Result<bool, Self::Error> {
+        ctx.records.lock().unwrap().push((
+            "validate".into(),
+            format!("t{}", task.index),
+            task.round,
+        ));
+        Ok(*output == task.round)
+    }
+}
+
+register_scenario!(RoundSetupScenario);
+
+#[test]
+fn round_mode_runs_setup_every_round_with_same_number() {
+    let ctx = RoundCtx {
+        records: Arc::new(Mutex::new(Vec::new())),
+    };
+    // 并发 2 × 每任务 2 轮 = 4 次 setup:round 为任务内轮次(0,1)
+    let manager = ScenarioManager::new(ManagerConfig::new(2).with_run_mode(RunMode::Times(4)));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let report = manager
+            .run_one::<RoundCtx>("RoundSetupScenario", &ctx)
+            .await
+            .expect("scenario should be found");
+        assert_eq!(report.success, 4);
+        assert_eq!(report.validate_success, 4);
+    });
+
+    let records = ctx.records.lock().unwrap().clone();
+
+    // setup 每轮执行:共 4 次;每任务每轮 setup/run/validate 恰好同号各一次
+    assert_eq!(records.iter().filter(|e| e.0 == "setup").count(), 4);
+    for i in 0..2 {
+        let tag = format!("t{i}");
+        for round in 0..2 {
+            for phase in ["setup", "run", "validate"] {
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|e| e.0 == phase && e.1 == tag && e.2 == round)
+                        .count(),
+                    1,
+                    "任务 {tag} round {round} 的 {phase} 应恰 1 次: {records:?}"
+                );
+            }
+        }
+    }
 }

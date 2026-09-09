@@ -14,22 +14,24 @@
 //!     type Ctx = AuthContext;
 //!     type Error = ctxlibs::http_client::HttpError;
 //!     type Output = ();
-//!     // 不需要预置数据时填 (),且无需实现 preset()
-//!     type Preset = ();
+//!     // 不需要预置数据时填 (),且无需实现 setup()
+//!     type Setup = ();
 //!
-//!     // preset() 为可选预置阶段:每个并发任务在 run 循环前执行一次,
-//!     // 可产出(登录会话/预热客户端等)供每轮 run/validate 借用
+//!     // setup() 为可选预置阶段:默认每个并发任务执行一次(Task 粒度),
+//!     // 可产出(登录会话/预热客户端等)供各轮 run/validate 借用;
+//!     // 声明 const SETUP_MODE: SetupMode = SetupMode::Round 可改为每轮执行
 //!     async fn run(
 //!         ctx: &AuthContext,
 //!         _task: &TaskIndex,
-//!         _preset: &(),
+//!         _setup: &(),
 //!     ) -> Result<(), Self::Error> {
 //!         let resp = ctx.client.get("/hello").await?;
 //!         Ok(())
 //!     }
 //!
-//!     // task 是框架分配的并发任务身份(task.index 可用于账号参数化);
-//!     // validate() / name() / preset() 均有默认实现,按需覆盖即可;
+//!     // task 是框架分配的并发任务身份(task.index 可用于账号参数化,
+//!     // task.round 为全局运行编号, 每轮取号);
+//!     // validate() / name() / setup() 均有默认实现,按需覆盖即可;
 //!     // 覆盖 validate 时可接收 run 的产出(output)做业务断言;
 //!     // run 返回 Err 时该轮直接记为失败,不会进入 validate
 //! }

@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc, sync::atomic::AtomicUsize};
+use std::any::Any;
 
 use futures::future::join_all;
 
@@ -71,8 +71,6 @@ impl ScenarioManager {
             .expect(&format!("{} 未配置执行模式(times/duration)", entry.name));
 
         let concurrency = self.config.concurrency;
-        // 全局运行编号计数器:preset 阶段取号,任务内三阶段共享同一编号
-        let round_counter = Arc::new(AtomicUsize::new(0));
 
         let cfgs: Vec<RunnerConfig> = match mode {
             RunMode::Times(total) => {
@@ -83,7 +81,6 @@ impl ScenarioManager {
                         mode: RunMode::Times(base + u64::from(i < rem)),
                         task_index: i as usize,
                         task_total: concurrency as usize,
-                        round_counter: round_counter.clone(),
                     })
                     .collect()
             }
@@ -92,7 +89,6 @@ impl ScenarioManager {
                     mode: RunMode::Duration(d),
                     task_index: i as usize,
                     task_total: concurrency as usize,
-                    round_counter: round_counter.clone(),
                 })
                 .collect(),
         };

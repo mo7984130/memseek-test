@@ -53,7 +53,6 @@ where
             mode: cfg.mode,
             task_index: cfg.task_index,
             task_total: cfg.task_total,
-            round_counter: cfg.round_counter.clone(),
         });
         runner.run(ctx).await
     })
