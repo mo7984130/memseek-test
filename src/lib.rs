@@ -10,6 +10,7 @@ pub mod error;
 pub mod ctxlibs;
 pub mod recorder;
 
+pub use report::{Report, ReportOptions, ScenarioReport};
 pub use runner::{RunMode, TaskIndex};
 
 // 让 #[macro_export] 宏展开时能写 $crate::inventory::submit!,
