@@ -101,6 +101,6 @@ impl ScenarioManager {
         for other in it {
             merged.merge(other);
         }
-        ScenarioReport::from_recorder(entry.name, merged)
+        ScenarioReport::from_recorder(entry.name, merged, self.config.concurrency)
     }
 }

@@ -2,13 +2,20 @@ use std::{borrow::Cow, collections::HashMap, time::Duration};
 
 use memseek_test::{Report, ReportOptions, ScenarioReport};
 
-fn sample_report(name: &'static str, times: u64, success: u64, failures: u64) -> ScenarioReport {
+fn sample_report(
+    name: &'static str,
+    times: u64,
+    success: u64,
+    failures: u64,
+    concurrency: u64,
+) -> ScenarioReport {
     let mut error_map = HashMap::new();
     if failures > 0 {
         error_map.insert(Cow::Borrowed("timeout"), failures);
     }
     ScenarioReport {
         name: Cow::Borrowed(name),
+        concurrency,
         times,
         total: Duration::from_millis(1200),
         avg: Duration::from_millis(12),
@@ -27,7 +34,7 @@ fn sample_report(name: &'static str, times: u64, success: u64, failures: u64) ->
 
 #[test]
 fn single_report_contains_core_stats() {
-    let r = sample_report("login", 100, 98, 2);
+    let r = sample_report("login", 100, 98, 2, 16);
     let text = r.report();
 
     assert!(text.contains("login"));
@@ -41,7 +48,7 @@ fn single_report_contains_core_stats() {
 
 #[test]
 fn single_report_rate_colored_when_requested() {
-    let r = sample_report("ok", 1000, 999, 1);
+    let r = sample_report("ok", 1000, 999, 1, 16);
     // 99.9% >= 0.99,应为绿色 32
     let colored = r.report_with(ReportOptions {
         color: true,
@@ -60,13 +67,14 @@ fn single_report_rate_colored_when_requested() {
 #[test]
 fn vec_report_has_summary_and_table() {
     let reports = vec![
-        sample_report("login", 1000, 998, 2),
-        sample_report("order", 500, 400, 100),
+        sample_report("login", 1000, 998, 2, 16),
+        sample_report("order", 500, 400, 100, 16),
     ];
     let text = reports.report();
 
     assert!(text.contains("Summary"));
     assert!(text.contains("Scenarios : 2"));
+    assert!(text.contains("Concurrent : 16"));
     assert!(text.contains("Requests  : 1500"));
     assert!(text.contains("Success   : 1398 (93.2%)"));
     assert!(text.contains("login"));
@@ -87,8 +95,8 @@ fn vec_report_empty() {
 #[test]
 fn report_with_works_on_vec_and_slice() {
     let reports = vec![
-        sample_report("login", 100, 98, 2),
-        sample_report("order", 50, 40, 10),
+        sample_report("login", 100, 98, 2, 16),
+        sample_report("order", 50, 40, 10, 16),
     ];
     let opts = ReportOptions {
         color: true,
@@ -104,7 +112,7 @@ fn report_with_works_on_vec_and_slice() {
 #[test]
 fn duration_formatting_scales() {
     // 通过 report_with 间接验证可读化单位
-    let mut r = sample_report("dur", 10, 10, 0);
+    let mut r = sample_report("dur", 10, 10, 0, 16);
     r.total = Duration::from_secs(3);
     r.avg = Duration::from_millis(250);
     r.max = Duration::from_millis(500);

@@ -10,6 +10,8 @@ use crate::recorder::Recorder;
 #[derive(Debug)]
 pub struct ScenarioReport {
     pub name: Cow<'static, str>,
+    /// 该场景的执行并发度(Manager 分配的任务数)。
+    pub concurrency: u64,
     pub times: u64,
     pub total: Duration,
     pub avg: Duration,
@@ -28,9 +30,14 @@ pub struct ScenarioReport {
 }
 
 impl ScenarioReport {
-    pub fn from_recorder(name: impl Into<Cow<'static, str>>, mut recorder: Recorder) -> Self {
+    pub fn from_recorder(
+        name: impl Into<Cow<'static, str>>,
+        mut recorder: Recorder,
+        concurrency: u64,
+    ) -> Self {
         Self {
             name: name.into(),
+            concurrency,
             times: recorder.times(),
             total: recorder.total(),
             avg: recorder.avg(),
@@ -54,6 +61,7 @@ impl Display for ScenarioReport {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         writeln!(f, "Scenario: {}", self.name)?;
         writeln!(f, "  Times: {}", self.times)?;
+        writeln!(f, "  Concurrency: {}", self.concurrency)?;
         writeln!(f, "  Total: {:?}", self.total)?;
         writeln!(f, "  Min:  {:?}", self.min)?;
         writeln!(f, "  Avg:  {:?}", self.avg)?;
@@ -171,6 +179,7 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
     let fail_rate = rate_of(r.failures, r.times);
 
     writeln!(out, "Requests : {}", r.times).unwrap();
+    writeln!(out, "Concurrent: {}", r.concurrency).unwrap();
     writeln!(out, "Total    : {}", fmt_duration(r.total)).unwrap();
     writeln!(
         out,
@@ -250,6 +259,16 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     let total_validate_success: u64 = reports.iter().map(|r| r.validate_success).sum();
     let total_validate_failures: u64 = reports.iter().map(|r| r.validate_failures).sum();
     let total_total: Duration = reports.iter().map(|r| r.total).sum();
+
+    // 并发度:各场景一致时显示单值,不一致时显示范围
+    let first_concurrency = reports[0].concurrency;
+    let concurrency_label = if reports.iter().all(|r| r.concurrency == first_concurrency) {
+        first_concurrency.to_string()
+    } else {
+        let min = reports.iter().map(|r| r.concurrency).min().unwrap();
+        let max = reports.iter().map(|r| r.concurrency).max().unwrap();
+        format!("{min}-{max}")
+    };
     let avg: Duration = if total_times > 0 {
         let num: u128 = reports
             .iter()
@@ -268,6 +287,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     )
     .unwrap();
     writeln!(out, "Scenarios : {}", reports.len()).unwrap();
+    writeln!(out, "Concurrent : {concurrency_label}").unwrap();
     writeln!(out, "Requests  : {}", total_times).unwrap();
     writeln!(out, "Total     : {}", fmt_duration(total_total)).unwrap();
     writeln!(out, "Avg       : {}", fmt_duration(avg)).unwrap();
