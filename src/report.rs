@@ -201,10 +201,10 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
         let max_ns = r.max.as_nanos().max(1) as f64;
         writeln!(out).unwrap();
         writeln!(out, "Latency (relative to max):").unwrap();
+        // 默认不展示 Min/Max,聚焦均值与分位数;
+        // 完整统计(含 Min/Max)仍在 ScenarioReport 字段与 Display 中可用。
         for (label, d) in [
-            ("Min", r.min),
             ("Avg", r.avg),
-            ("Max", r.max),
             ("P50", r.p50),
             ("P95", r.p95),
             ("P99", r.p99),

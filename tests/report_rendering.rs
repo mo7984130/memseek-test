@@ -44,6 +44,9 @@ fn single_report_contains_core_stats() {
     assert!(text.contains("Latency"));
     assert!(text.contains("P95"));
     assert!(text.contains("timeout"));
+    // 默认不显示 Min/Max(聚焦均值与分位数)
+    assert!(!text.contains("  Min"), "默认不应含 Min 行: {text}");
+    assert!(!text.contains("  Max"), "默认不应含 Max 行: {text}");
 }
 
 #[test]
