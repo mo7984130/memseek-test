@@ -9,6 +9,7 @@ use crate::{
     error::ScenarioError,
     recorder::Recorder,
     scenario::{Scenario, SetupMode},
+    shutdown::Shutdown,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +51,8 @@ pub struct RunnerConfig {
     pub task_index: usize,
     /// 并发任务总数
     pub task_total: usize,
+    /// 优雅关闭信号;触发后当前轮次完成即停止(不再启动新轮次)
+    pub shutdown: Option<Shutdown>,
 }
 
 pub struct ScenarioRunner<S> {
@@ -86,8 +89,14 @@ where
     pub async fn run(&self, ctx: &S::Ctx) -> Recorder {
         let mut recorder = Recorder::from_config(&self.config);
 
+        // 优雅关闭:信号到达时已完成当前轮次,不再启动新轮次。
+        // 各分支在 setup 后/每轮开始前检查。
         match S::SETUP_MODE {
             SetupMode::Task => {
+                if self.is_cancelled() {
+                    recorder.record_interrupted();
+                    return recorder;
+                }
                 // setup 任务级一次(round 无轮次含义,固定 0),产出供各轮复用
                 let setup_task = TaskIndex::new(self.config.task_index, self.config.task_total, 0);
                 let setup = match S::setup(ctx, &setup_task).await {
@@ -97,9 +106,18 @@ where
                         return recorder;
                     }
                 };
+                // setup 期间收到信号:等 setup 完成后直接退出,不进入 run 循环
+                if self.is_cancelled() {
+                    recorder.record_interrupted();
+                    return recorder;
+                }
                 match self.config.mode {
                     RunMode::Times(times) => {
                         for round in 0..times {
+                            if self.is_cancelled() {
+                                recorder.record_interrupted();
+                                break;
+                            }
                             let task = TaskIndex::new(
                                 self.config.task_index,
                                 self.config.task_total,
@@ -113,6 +131,10 @@ where
                         let mut round = 0usize;
 
                         while !remaining.is_zero() {
+                            if self.is_cancelled() {
+                                recorder.record_interrupted();
+                                break;
+                            }
                             let start = Instant::now();
                             let task = TaskIndex::new(
                                 self.config.task_index,
@@ -133,6 +155,10 @@ where
                 match self.config.mode {
                     RunMode::Times(times) => {
                         for round in 0..times {
+                            if self.is_cancelled() {
+                                recorder.record_interrupted();
+                                break;
+                            }
                             let task = TaskIndex::new(
                                 self.config.task_index,
                                 self.config.task_total,
@@ -153,6 +179,10 @@ where
                         let mut round = 0usize;
 
                         while !remaining.is_zero() {
+                            if self.is_cancelled() {
+                                recorder.record_interrupted();
+                                break;
+                            }
                             let start = Instant::now();
                             let task = TaskIndex::new(
                                 self.config.task_index,
@@ -178,6 +208,14 @@ where
         }
 
         recorder
+    }
+
+    /// 是否已收到优雅关闭信号。
+    fn is_cancelled(&self) -> bool {
+        self.config
+            .shutdown
+            .as_ref()
+            .is_some_and(|s| s.is_cancelled())
     }
 
     /// 执行一次 `run` 并记录耗时/结果,返回本轮产出。

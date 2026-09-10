@@ -53,6 +53,7 @@ where
             mode: cfg.mode,
             task_index: cfg.task_index,
             task_total: cfg.task_total,
+            shutdown: cfg.shutdown.clone(),
         });
         runner.run(ctx).await
     })

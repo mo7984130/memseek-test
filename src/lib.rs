@@ -4,6 +4,7 @@ pub mod registry;
 pub mod report;
 pub mod runner;
 pub mod scenario;
+pub mod shutdown;
 
 pub mod error;
 
@@ -12,6 +13,7 @@ pub mod recorder;
 
 pub use report::{Report, ReportOptions, ScenarioReport};
 pub use runner::{RunMode, TaskIndex};
+pub use shutdown::{Shutdown, ShutdownSender};
 
 // 让 #[macro_export] 宏展开时能写 $crate::inventory::submit!,
 // 使用者的 Cargo.toml 不需要显式依赖 inventory

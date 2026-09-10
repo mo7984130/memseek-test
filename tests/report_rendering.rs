@@ -29,6 +29,7 @@ fn sample_report(
         success,
         failures,
         error_map,
+        interrupted: false,
     }
 }
 

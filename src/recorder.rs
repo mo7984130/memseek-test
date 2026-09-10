@@ -15,6 +15,8 @@ pub struct Recorder {
 
     pub validate_success: u64,
     pub validate_failures: u64,
+    /// 该任务是否因优雅关闭(停止信号)提前结束
+    pub interrupted: bool,
 }
 
 impl Default for Recorder {
@@ -33,6 +35,7 @@ impl Recorder {
             error_map: HashMap::new(),
             validate_success: 0,
             validate_failures: 0,
+            interrupted: false,
         }
     }
 
@@ -96,7 +99,8 @@ impl Recorder {
         }
 
         self.validate_success += other.validate_success;
-        self.validate_failures += other.validate_failures
+        self.validate_failures += other.validate_failures;
+        self.interrupted |= other.interrupted;
     }
 
     pub fn record_duration(&mut self, duration: Duration) {
@@ -132,5 +136,10 @@ impl Recorder {
                 self.validate_failures += 1;
             }
         }
+    }
+
+    /// 标记该任务因优雅关闭提前结束(计入报告)。
+    pub fn record_interrupted(&mut self) {
+        self.interrupted = true;
     }
 }

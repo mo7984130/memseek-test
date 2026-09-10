@@ -27,6 +27,9 @@ pub struct ScenarioReport {
     pub success: u64,
     pub failures: u64,
     pub error_map: HashMap<Cow<'static, str>, u64>,
+
+    /// 该场景是否因优雅关闭(停止信号)提前结束
+    pub interrupted: bool,
 }
 
 impl ScenarioReport {
@@ -53,6 +56,7 @@ impl ScenarioReport {
             success: recorder.success,
             failures: recorder.failures,
             error_map: recorder.error_map,
+            interrupted: recorder.interrupted,
         }
     }
 }
@@ -75,6 +79,9 @@ impl Display for ScenarioReport {
 
         writeln!(f, "  Success: {}", self.success)?;
         writeln!(f, "  Failures: {}", self.failures)?;
+        if self.interrupted {
+            writeln!(f, "  Interrupted: true (graceful shutdown)")?;
+        }
 
         if !self.error_map.is_empty() {
             writeln!(f, "  Errors:")?;
@@ -196,6 +203,14 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
         r.validate_success, r.validate_failures,
     )
     .unwrap();
+    if r.interrupted {
+        writeln!(
+            out,
+            "{}",
+            paint("Interrupted: yes (graceful shutdown)", "33", o.color)
+        )
+        .unwrap();
+    }
 
     if r.times > 0 {
         let max_ns = r.max.as_nanos().max(1) as f64;
@@ -306,6 +321,22 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         total_validate_success, total_validate_failures,
     )
     .unwrap();
+    let interrupted_count = reports.iter().filter(|r| r.interrupted).count();
+    if interrupted_count > 0 {
+        writeln!(
+            out,
+            "{}",
+            paint(
+                &format!(
+                    "Interrupted: {interrupted_count}/{} scenarios (graceful shutdown)",
+                    reports.len()
+                ),
+                "33",
+                o.color,
+            )
+        )
+        .unwrap();
+    }
     writeln!(
         out,
         "Overall   : {} {}",
