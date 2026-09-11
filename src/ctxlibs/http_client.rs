@@ -4,6 +4,10 @@ use crate::error::ScenarioError;
 use reqwest::{IntoUrl, Method, Response, StatusCode, Url};
 use serde::ser::Error as _;
 
+/// 重新导出 reqwest 的 multipart 类型(`Form` / `Part`),
+/// 便于构造 multipart/form-data 表单,且与 crate 内部 reqwest 版本一致。
+pub use reqwest::multipart;
+
 /// 请求/响应内容捕获开关。
 ///
 /// 值为 `0` 时表示不捕获该侧内容;默认两侧各截断到 512 字符,见 [`CaptureOptions::default`]。
@@ -248,6 +252,39 @@ impl Client {
         Ok(resp)
     }
 
+    /// POST 请求:发送 multipart/form-data 表单(文件上传等)。
+    /// 状态码非 200 时返回错误;二进制内容不做文本快照。
+    /// 用 [`multipart::Form`](reqwest::multipart::Form) 构造表单项。
+    pub async fn post_multipart(
+        &self,
+        url: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<Response, HttpError> {
+        let url = self.base_url.join(url)?;
+        let resp = self.inner.post(url.clone()).multipart(form).send().await?;
+        if resp.status() != StatusCode::OK {
+            return Err(
+                HttpError::from_response(resp, Method::POST, url, None, &self.capture).await,
+            );
+        }
+        Ok(resp)
+    }
+
+    /// POST 请求:发送 multipart/form-data 表单,原样返回响应(不校验状态码)。
+    pub async fn post_multipart_raw(
+        &self,
+        url: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<Response, HttpError> {
+        let resp = self
+            .inner
+            .post(self.base_url.join(url)?)
+            .multipart(form)
+            .send()
+            .await?;
+        Ok(resp)
+    }
+
     /// PUT 请求:状态码非 200 时返回错误。
     /// `body` 接受任意 `Serialize` 值(如 `json!({...})` 或 `&Struct`)。
     pub async fn put(&self, url: &str, body: impl serde::Serialize) -> Result<Response, HttpError> {
@@ -408,6 +445,8 @@ pub struct RequestBuilder<'a> {
     method: reqwest::Method,
     url: String,
     body: Option<reqwest::Body>,
+    /// multipart 表单;与 `body` 互斥(设置其一即清空另一)
+    multipart: Option<reqwest::multipart::Form>,
     headers: reqwest::header::HeaderMap,
     query: Vec<(String, String)>,
     body_snapshot: Option<String>,
@@ -420,6 +459,7 @@ impl<'a> RequestBuilder<'a> {
             method,
             url: url.to_string(),
             body: None,
+            multipart: None,
             headers: reqwest::header::HeaderMap::new(),
             query: Vec::new(),
             body_snapshot: None,
@@ -427,10 +467,10 @@ impl<'a> RequestBuilder<'a> {
     }
 
     pub fn header(mut self, key: &str, value: &str) -> Self {
-        if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
-            if let Ok(header_value) = reqwest::header::HeaderValue::from_str(value) {
-                self.headers.insert(header_name, header_value);
-            }
+        if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            && let Ok(header_value) = reqwest::header::HeaderValue::from_str(value)
+        {
+            self.headers.insert(header_name, header_value);
         }
         self
     }
@@ -448,6 +488,7 @@ impl<'a> RequestBuilder<'a> {
     /// 设置 JSON body
     pub fn json<B: serde::Serialize>(mut self, body: &B) -> Result<Self, serde_json::Error> {
         let bytes = serde_json::to_vec(body)?;
+        self.multipart = None;
         self.body_snapshot = self.client.capture_body(&bytes);
         self.body = Some(reqwest::Body::from(bytes));
         self.headers.insert(
@@ -463,6 +504,7 @@ impl<'a> RequestBuilder<'a> {
     }
 
     pub fn body(mut self, body: impl Into<reqwest::Body>) -> Self {
+        self.multipart = None;
         self.body = Some(body.into());
         self
     }
@@ -471,6 +513,7 @@ impl<'a> RequestBuilder<'a> {
     pub fn form<B: serde::Serialize>(mut self, form: &B) -> Result<Self, serde_json::Error> {
         let encoded = serde_urlencoded::to_string(form)
             .map_err(|e| serde_json::Error::custom(e.to_string()))?;
+        self.multipart = None;
         self.body_snapshot = self.client.capture_body(encoded.as_bytes());
         self.body = Some(reqwest::Body::from(encoded.into_bytes()));
         self.headers.insert(
@@ -478,6 +521,17 @@ impl<'a> RequestBuilder<'a> {
             reqwest::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
         Ok(self)
+    }
+
+    /// 设置 multipart/form-data 表单(文件上传等)。
+    ///
+    /// 与 [`Self::json`]/[`Self::form`]/[`Self::body`] 互斥,后设置者生效。
+    /// 二进制内容不做文本快照,错误上下文中的 `request_body` 为 `None`。
+    pub fn multipart(mut self, form: reqwest::multipart::Form) -> Self {
+        self.body = None;
+        self.body_snapshot = None;
+        self.multipart = Some(form);
+        self
     }
 
     /// 统一的发送实现:解析完整 URL 并发起请求。
@@ -488,6 +542,7 @@ impl<'a> RequestBuilder<'a> {
         headers: reqwest::header::HeaderMap,
         query: Vec<(String, String)>,
         body: Option<reqwest::Body>,
+        multipart: Option<reqwest::multipart::Form>,
     ) -> Result<Response, HttpError> {
         let mut req_builder = client.inner.request(method, full_url);
 
@@ -503,8 +558,10 @@ impl<'a> RequestBuilder<'a> {
             req_builder = req_builder.query(&query);
         }
 
-        // 添加 body
-        if let Some(body) = body {
+        // 添加 body;multipart 与普通 body 互斥,优先 multipart
+        if let Some(form) = multipart {
+            req_builder = req_builder.multipart(form);
+        } else if let Some(body) = body {
             req_builder = req_builder.body(body);
         }
 
@@ -517,12 +574,13 @@ impl<'a> RequestBuilder<'a> {
             method,
             url: path,
             body,
+            multipart,
             headers,
             query,
             body_snapshot: _,
         } = self;
         let full_url = client.base_url.join(&path)?;
-        Self::send_impl(client, method, full_url, headers, query, body).await
+        Self::send_impl(client, method, full_url, headers, query, body, multipart).await
     }
 
     /// 发送请求并自动检查状态码(自动捕获请求/响应内容快照)
@@ -532,6 +590,7 @@ impl<'a> RequestBuilder<'a> {
             method,
             url: path,
             body,
+            multipart,
             headers,
             query,
             body_snapshot,
@@ -544,6 +603,7 @@ impl<'a> RequestBuilder<'a> {
             headers,
             query,
             body,
+            multipart,
         )
         .await?;
         if resp.status() != StatusCode::OK {

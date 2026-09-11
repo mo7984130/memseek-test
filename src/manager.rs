@@ -136,7 +136,7 @@ impl ScenarioManager {
             .config
             .run_mode
             .or(entry.config.run_mode)
-            .expect(&format!("{} 未配置执行模式(times/duration)", entry.name));
+            .unwrap_or_else(|| panic!("{} 未配置执行模式(times/duration)", entry.name));
 
         let concurrency = self.config.concurrency;
 

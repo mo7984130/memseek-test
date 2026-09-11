@@ -23,6 +23,13 @@ impl ScenarioConfig {
     }
 }
 
+/// 场景统一入口的函数指针类型:接收 Ctx 与配置,返回 runner 的结果。
+///
+/// 抽成别名以降低 [`ScenarioRegistration::invoke`] 字段的类型复杂度;
+/// 宏 `register_scenario!` 生成的条目以 `invoke::<S>` 函数项指针存入。
+pub type ScenarioInvoke =
+    for<'a> fn(&'a dyn Any, &'a RunnerConfig) -> Pin<Box<dyn Future<Output = Recorder> + 'a>>;
+
 pub struct ScenarioRegistration {
     /// 场景名(用于 `find` / `run_one` 匹配)。
     pub name: &'static str,
@@ -31,8 +38,7 @@ pub struct ScenarioRegistration {
     /// 场景默认配置(宏里指定;运行时被 Manager 全局配置覆盖)。
     pub config: ScenarioConfig,
     /// 统一入口(宏生成,函数项指针 `invoke::<S>`)。
-    pub invoke:
-        for<'a> fn(&'a dyn Any, &'a RunnerConfig) -> Pin<Box<dyn Future<Output = Recorder> + 'a>>,
+    pub invoke: ScenarioInvoke,
 }
 
 inventory::collect!(ScenarioRegistration);

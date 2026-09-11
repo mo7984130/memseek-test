@@ -1,7 +1,7 @@
 use memseek_test::ctxlibs::http_client::{CaptureOptions, Client, HttpError};
 use reqwest::Method;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// 极简假服务器:读完请求头(到空行)后,返回固定 body 的 400 响应。
 async fn fake_server_400(body: &'static str) -> String {
@@ -166,5 +166,118 @@ fn post_still_accepts_reference() {
         let _ = client
             .post("/auth/login", &json!({ "username": "x" }))
             .await;
+    });
+}
+
+/// 假服务器:读取请求头与请求体,回显 `Content-Type` 与 body 原文
+/// (用于校验 multipart 编码)。
+async fn fake_server_echo() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = sock.into_split();
+            let mut reader = BufReader::new(reader);
+
+            let mut content_type = String::new();
+            let mut content_length = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if lower.starts_with("content-type:") {
+                    // 从原始行取值,保留大小写
+                    content_type = line["content-type:".len()..].trim().to_string();
+                } else if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body).await.unwrap();
+            }
+            let preview = String::from_utf8_lossy(&body).to_string();
+            let resp_body = format!("{content_type}\n{preview}");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            let _ = writer.write_all(resp.as_bytes()).await;
+            let _ = writer.shutdown().await;
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn build_form() -> reqwest::multipart::Form {
+    use reqwest::multipart::{Form, Part};
+
+    Form::new().text("username", "alice").part(
+        "avatar",
+        Part::bytes(b"PNGDATA".to_vec())
+            .file_name("a.png")
+            .mime_str("image/png")
+            .unwrap(),
+    )
+}
+
+#[test]
+fn post_multipart_sends_form_data() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let base = fake_server_echo().await;
+        let client = Client::new(&base).unwrap();
+
+        let resp = client
+            .post_multipart("/upload", build_form())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.starts_with("multipart/form-data; boundary="),
+            "Content-Type 应为 multipart/form-data: {text}"
+        );
+        assert!(text.contains("name=\"username\""), "{text}");
+        assert!(text.contains("alice"), "{text}");
+        assert!(
+            text.contains("name=\"avatar\"; filename=\"a.png\""),
+            "{text}"
+        );
+        assert!(text.contains("Content-Type: image/png"), "{text}");
+        assert!(text.contains("PNGDATA"), "{text}");
+    });
+}
+
+#[test]
+fn request_builder_multipart_send_checked() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let base = fake_server_echo().await;
+        let client = Client::new(&base).unwrap();
+
+        let resp = client
+            .request(Method::POST, "/upload")
+            .multipart(build_form())
+            .send_checked()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("name=\"username\""), "{text}");
+        assert!(text.contains("PNGDATA"), "{text}");
     });
 }
