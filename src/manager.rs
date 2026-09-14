@@ -3,6 +3,7 @@ use std::any::Any;
 use futures::future::join_all;
 
 use crate::{
+    progress::{Progress, ProgressOptions, ProgressPlan},
     registry::{ScenarioRegistration, ScenarioRegistry},
     report::ScenarioReport,
     runner::{RunMode, RunnerConfig},
@@ -17,6 +18,8 @@ pub struct ManagerConfig {
     run_mode: Option<RunMode>,
     /// 全局优雅关闭信号;也可在调用时用 `run*_with_shutdown` 显式传入
     shutdown: Option<Shutdown>,
+    /// 实时进度显示选项;`None` 表示关闭(默认)
+    progress: Option<ProgressOptions>,
 }
 impl ManagerConfig {
     pub fn new(concurrency: u64) -> Self {
@@ -27,6 +30,7 @@ impl ManagerConfig {
             concurrency,
             run_mode: None,
             shutdown: None,
+            progress: None,
         }
     }
 
@@ -46,6 +50,23 @@ impl ManagerConfig {
     /// 须在 Tokio runtime 内调用。
     pub fn install_ctrl_c(mut self) -> Self {
         self.shutdown = Some(Shutdown::install_ctrl_c());
+        self
+    }
+
+    /// 开启实时进度显示(单行,输出到 stderr)。
+    ///
+    /// 每个场景一行:`场景名 [进度条] 百分比 已完成/计划 吞吐 [fail] [inflight]`;
+    /// 场景结束(含优雅关闭)后该行定稿保留。stderr 非 TTY(CI/重定向)时
+    /// 自动静默,可用 [`Self::with_progress_options`] 配合
+    /// [`ProgressOptions::force`] 强制输出。
+    pub fn with_progress(mut self) -> Self {
+        self.progress = Some(ProgressOptions::default());
+        self
+    }
+
+    /// 同 [`Self::with_progress`],但自定义刷新间隔/颜色/条宽等选项。
+    pub fn with_progress_options(mut self, options: ProgressOptions) -> Self {
+        self.progress = Some(options);
         self
     }
 }
@@ -140,6 +161,17 @@ impl ScenarioManager {
 
         let concurrency = self.config.concurrency;
 
+        // 实时进度:每场景一个句柄(计划量取自本场景解析后的 RunMode),
+        // 由 Manager 注入各并发任务;未开启时为 None,零开销。
+        let progress = self.config.progress.map(|options| {
+            let plan = match mode {
+                RunMode::Times(total) => ProgressPlan::Rounds(total),
+                RunMode::Duration(d) => ProgressPlan::Time(d),
+            };
+            Progress::new(entry.name, plan, options)
+        });
+        let progress_guard = progress.as_ref().map(|p| p.start(shutdown.cloned()));
+
         let cfgs: Vec<RunnerConfig> = match mode {
             RunMode::Times(total) => {
                 let base = total / concurrency;
@@ -150,6 +182,7 @@ impl ScenarioManager {
                         task_index: i as usize,
                         task_total: concurrency as usize,
                         shutdown: shutdown.cloned(),
+                        progress: progress.clone(),
                     })
                     .collect()
             }
@@ -159,12 +192,19 @@ impl ScenarioManager {
                     task_index: i as usize,
                     task_total: concurrency as usize,
                     shutdown: shutdown.cloned(),
+                    progress: progress.clone(),
                 })
                 .collect(),
         };
 
         let futures: Vec<_> = cfgs.iter().map(|c| (entry.invoke)(ctx, c)).collect();
         let results = join_all(futures).await;
+
+        // 所有轮次结束后停止渲染,等最后一行写完,再交给调用方打印报告;
+        // 提前返回/取消的路径由守卫 drop 兜底停止。
+        if let Some(guard) = progress_guard {
+            guard.stop().await;
+        }
 
         let mut it = results.into_iter();
         let mut merged = it.next().expect("concurrency must be > 0");

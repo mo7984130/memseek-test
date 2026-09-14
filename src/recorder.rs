@@ -3,11 +3,15 @@ use std::{borrow::Cow, collections::HashMap, time::Duration};
 use hdrhistogram::Histogram;
 use tracing::warn;
 
-use crate::{error::ScenarioError, runner::RunnerConfig};
+use crate::{error::ScenarioError, progress::Progress, runner::RunnerConfig};
 
 pub struct Recorder {
     histogram: Histogram<u64>,
     total: Duration,
+
+    /// 实时进度上报句柄(`None` 表示不上报);由 [`Recorder::from_config`] 注入。
+    /// 所有进度钩子汇集在此:报告统计与进度展示的数字同源。
+    progress: Option<Progress>,
 
     pub success: u64,
     pub failures: u64,
@@ -30,6 +34,7 @@ impl Recorder {
         Self {
             histogram: Histogram::new(3).unwrap(),
             total: Duration::ZERO,
+            progress: None,
             success: 0,
             failures: 0,
             error_map: HashMap::new(),
@@ -39,8 +44,13 @@ impl Recorder {
         }
     }
 
-    pub fn from_config(_config: &RunnerConfig) -> Self {
-        Self::new()
+    /// 从运行配置创建:`RunnerConfig::progress` 存在时,后续 `record_*`
+    /// 会同步累加实时进度计数。
+    pub fn from_config(config: &RunnerConfig) -> Self {
+        Self {
+            progress: config.progress.clone(),
+            ..Self::new()
+        }
     }
 
     pub fn total(&self) -> Duration {
@@ -101,6 +111,37 @@ impl Recorder {
         self.validate_success += other.validate_success;
         self.validate_failures += other.validate_failures;
         self.interrupted |= other.interrupted;
+        // 合并发生在所有轮次结束之后:汇合后的 Recorder 不再上报进度,
+        // 避免误用时对共享计数二次累加
+        self.progress = None;
+    }
+
+    /// 标记一轮 `run` 开始(实时进度的在途请求计数)。
+    pub fn begin_round(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress.begin_round();
+        }
+    }
+
+    /// 标记一轮 `run` 结束。
+    pub fn end_round(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress.end_round();
+        }
+    }
+
+    /// 标记进入任务级 `setup` 阶段。
+    pub fn begin_setup(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress.begin_setup();
+        }
+    }
+
+    /// 标记退出任务级 `setup` 阶段。
+    pub fn end_setup(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress.end_setup();
+        }
     }
 
     pub fn record_duration(&mut self, duration: Duration) {
@@ -108,6 +149,9 @@ impl Recorder {
             .record(duration.as_micros() as u64)
             .expect("duration is out of histogram range");
         self.total += duration;
+        if let Some(progress) = &self.progress {
+            progress.round_recorded();
+        }
     }
 
     pub fn record_result<T, E>(&mut self, result: &std::result::Result<T, E>)
@@ -125,6 +169,9 @@ impl Recorder {
                     .or_insert(1);
             }
         }
+        if let Some(progress) = &self.progress {
+            progress.result_recorded(result.is_ok());
+        }
     }
 
     pub fn record_validate(&mut self, validate_result: bool) {
@@ -135,6 +182,9 @@ impl Recorder {
             false => {
                 self.validate_failures += 1;
             }
+        }
+        if let Some(progress) = &self.progress {
+            progress.validate_recorded(validate_result);
         }
     }
 

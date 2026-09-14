@@ -7,6 +7,7 @@ use tracing::warn;
 
 use crate::{
     error::ScenarioError,
+    progress::Progress,
     recorder::Recorder,
     scenario::{Scenario, SetupMode},
     shutdown::Shutdown,
@@ -53,6 +54,8 @@ pub struct RunnerConfig {
     pub task_total: usize,
     /// 优雅关闭信号;触发后当前轮次完成即停止(不再启动新轮次)
     pub shutdown: Option<Shutdown>,
+    /// 实时进度上报句柄(由 Manager 注入);`None` 表示不上报
+    pub progress: Option<Progress>,
 }
 
 pub struct ScenarioRunner<S> {
@@ -99,7 +102,10 @@ where
                 }
                 // setup 任务级一次(round 无轮次含义,固定 0),产出供各轮复用
                 let setup_task = TaskIndex::new(self.config.task_index, self.config.task_total, 0);
-                let setup = match S::setup(ctx, &setup_task).await {
+                recorder.begin_setup();
+                let setup = S::setup(ctx, &setup_task).await;
+                recorder.end_setup();
+                let setup = match setup {
                     Ok(setup) => setup,
                     Err(err) => {
                         recorder.record_result(&Err::<(), S::Error>(err));
@@ -227,7 +233,9 @@ where
         recorder: &mut Recorder,
     ) -> Result<S::Output, S::Error> {
         let start = Instant::now();
+        recorder.begin_round();
         let result = S::run(ctx, task, setup).await;
+        recorder.end_round();
 
         recorder.record_duration(start.elapsed());
         recorder.record_result(&result);

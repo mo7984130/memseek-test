@@ -1,5 +1,6 @@
 pub mod make_scenario;
 pub mod manager;
+pub mod progress;
 pub mod registry;
 pub mod report;
 pub mod runner;
@@ -11,6 +12,7 @@ pub mod error;
 pub mod ctxlibs;
 pub mod recorder;
 
+pub use progress::{Progress, ProgressOptions};
 pub use report::{Report, ReportOptions, ScenarioReport};
 pub use runner::{RunMode, TaskIndex};
 pub use shutdown::{Shutdown, ShutdownSender};

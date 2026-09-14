@@ -423,7 +423,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
 /// 是否启用颜色的判定:由 `ReportOptions::color` 显式控制。
 /// 默认关闭颜色,保证输出可预测、可直接写入日志/文件;
 /// 需要彩色时用 `report_with(ReportOptions { color: true, .. })`。
-fn paint(s: &str, code: &str, enabled: bool) -> String {
+pub(crate) fn paint(s: &str, code: &str, enabled: bool) -> String {
     if enabled {
         format!("\x1b[{code}m{s}\x1b[0m")
     } else {
@@ -460,14 +460,14 @@ fn rate_label(rate: f64) -> &'static str {
 }
 
 /// 生成 ASCII 条形图,`fraction` 为 0.0 ~ 1.0
-fn bar(fraction: f64, width: usize) -> String {
+pub(crate) fn bar(fraction: f64, width: usize) -> String {
     let width = width.max(1);
     let filled = (fraction.clamp(0.0, 1.0) * width as f64).round() as usize;
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
 /// 可读化 Duration,按量级自适应单位
-fn fmt_duration(d: Duration) -> String {
+pub(crate) fn fmt_duration(d: Duration) -> String {
     let ns = d.as_nanos();
     if ns >= 1_000_000_000 {
         format!("{:.2}s", ns as f64 / 1e9)

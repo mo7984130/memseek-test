@@ -1,6 +1,6 @@
 [package]
 name = "memseek-test"
-version = "0.14.1"
+version = "0.15.0"
 edition = "2024"
 description = "Scenario-based async load testing framework with HTTP helpers, HDR histogram latency reports and graceful shutdown"
 license = "MIT"
@@ -19,7 +19,7 @@ serde = "1.0.229"
 serde_json = "1.0.151"
 serde_urlencoded = "0.7"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["signal"] }
+tokio = { version = "1.53.1", features = ["signal", "rt", "time"] }
 tracing = "0.1.44"
 url = "2.5.8"
 
