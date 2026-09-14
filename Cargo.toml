@@ -2,6 +2,13 @@
 name = "memseek-test"
 version = "0.14.1"
 edition = "2024"
+description = "Scenario-based async load testing framework with HTTP helpers, HDR histogram latency reports and graceful shutdown"
+license = "MIT"
+repository = "https://github.com/mo7984130/memseek-test"
+homepage = "https://github.com/mo7984130/memseek-test"
+documentation = "https://docs.rs/memseek-test"
+keywords = ["load-testing", "benchmark", "testing", "http", "async"]
+categories = ["development-tools::testing", "asynchronous"]
 
 [dependencies]
 futures = "0.3.34"
