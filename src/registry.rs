@@ -60,6 +60,7 @@ where
             task_index: cfg.task_index,
             task_total: cfg.task_total,
             shutdown: cfg.shutdown.clone(),
+            #[cfg(feature = "tui")]
             progress: cfg.progress.clone(),
         });
         runner.run(ctx).await

@@ -1,5 +1,6 @@
 pub mod make_scenario;
 pub mod manager;
+#[cfg(feature = "tui")]
 pub mod progress;
 pub mod registry;
 pub mod report;
@@ -14,7 +15,8 @@ pub mod error;
 pub mod ctxlibs;
 pub mod recorder;
 
-pub use progress::{LogChannel, Progress, ProgressOptions};
+#[cfg(feature = "tui")]
+pub use progress::{LogChannel, Progress};
 pub use report::{Report, ReportOptions, ScenarioReport};
 pub use runner::{RunMode, TaskIndex};
 pub use shutdown::{Shutdown, ShutdownSender};

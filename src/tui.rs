@@ -24,8 +24,7 @@
 //! ```
 //!
 //! 非 TTY(CI/重定向)时自动静默(不进入全屏);每次运行结束后日志缓冲
-//! 回放到 stderr,保证日志档案完整。TUI 与 [`ManagerConfig::with_progress`]
-//! 单行模式互斥。
+//! 回放到 stderr,保证日志档案完整。
 //!
 //! 已知限制:终端高度未知,日志区固定显示 [`TuiOptions::log_lines`] 行
 //! (默认 12),若终端行数 < 进度区 + 日志区,进度行会被顶出可视区,
@@ -47,6 +46,8 @@ pub struct TuiOptions {
     pub refresh: Duration,
     /// 进度条宽度(字符数,默认 20)
     pub bar_width: usize,
+    /// 进度行是否启用 ANSI 颜色,默认 `false`
+    pub color: bool,
     /// 日志通道;`None` 时由 Manager 自动创建(仅收编框架内部日志)
     channel: Option<LogChannel>,
 }
@@ -58,6 +59,7 @@ impl Default for TuiOptions {
             buffer_lines: 500,
             refresh: Duration::from_millis(100),
             bar_width: 20,
+            color: false,
             channel: None,
         }
     }

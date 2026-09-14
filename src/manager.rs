@@ -3,9 +3,10 @@ use std::any::Any;
 use futures::future::join_all;
 
 #[cfg(feature = "tui")]
+use crate::progress::{Progress, ProgressGuard, ProgressPlan};
+#[cfg(feature = "tui")]
 use crate::tui::TuiOptions;
 use crate::{
-    progress::{Progress, ProgressOptions, ProgressPlan},
     registry::{ScenarioRegistration, ScenarioRegistry},
     report::ScenarioReport,
     runner::{RunMode, RunnerConfig},
@@ -20,9 +21,7 @@ pub struct ManagerConfig {
     run_mode: Option<RunMode>,
     /// 全局优雅关闭信号;也可在调用时用 `run*_with_shutdown` 显式传入
     shutdown: Option<Shutdown>,
-    /// 实时进度显示选项;`None` 表示关闭(默认)
-    progress: Option<ProgressOptions>,
-    /// 终端 TUI 显示选项(feature `tui`);与 `progress` 互斥
+    /// 终端 TUI 显示选项(feature `tui`);`None` 表示关闭(默认)
     #[cfg(feature = "tui")]
     tui: Option<TuiOptions>,
 }
@@ -35,7 +34,6 @@ impl ManagerConfig {
             concurrency,
             run_mode: None,
             shutdown: None,
-            progress: None,
             #[cfg(feature = "tui")]
             tui: None,
         }
@@ -60,33 +58,16 @@ impl ManagerConfig {
         self
     }
 
-    /// 开启实时进度显示(单行,输出到 stderr)。
-    ///
-    /// 每个场景一行:`场景名 [进度条] 百分比 已完成/计划 吞吐 [fail] [inflight]`;
-    /// 场景结束(含优雅关闭)后该行定稿保留。stderr 非 TTY(CI/重定向)时
-    /// 自动静默,可用 [`Self::with_progress_options`] 配合
-    /// [`ProgressOptions::force`] 强制输出。
-    pub fn with_progress(mut self) -> Self {
-        self.progress = Some(ProgressOptions::default());
-        self
-    }
-
-    /// 同 [`Self::with_progress`],但自定义刷新间隔/颜色/条宽等选项。
-    pub fn with_progress_options(mut self, options: ProgressOptions) -> Self {
-        self.progress = Some(options);
-        self
-    }
-
-    /// 开启终端 TUI 模式(需 feature `tui`):全屏显示顶部进度 + 日志区,
-    /// 退出后日志缓冲回放到 stderr。与 [`Self::with_progress`] 互斥。
-    /// 非 TTY(CI/重定向)时自动静默。
+    /// 开启终端 TUI 模式(需 feature `tui`):进 alternate screen 全屏显示
+    /// 顶部进度行 + 日志滚动区,退出后日志缓冲回放到 stderr 补全档案。
+    /// 非 TTY(CI/重定向)时自动静默(不做任何输出)。
     #[cfg(feature = "tui")]
     pub fn with_tui(mut self) -> Self {
         self.tui = Some(TuiOptions::default());
         self
     }
 
-    /// 同 [`Self::with_tui`],自定义日志区行数/缓冲/刷新等选项。
+    /// 同 [`Self::with_tui`],自定义日志区行数/缓冲/刷新/颜色等选项。
     #[cfg(feature = "tui")]
     pub fn with_tui_options(mut self, options: TuiOptions) -> Self {
         self.tui = Some(options);
@@ -184,13 +165,8 @@ impl ScenarioManager {
 
         let concurrency = self.config.concurrency;
 
-        let plan = match mode {
-            RunMode::Times(total) => ProgressPlan::Rounds(total),
-            RunMode::Duration(d) => ProgressPlan::Time(d),
-        };
-
-        // 进度显示模式二选一:单行(progress)或 TUI(feature `tui`);
-        // 两种模式共享同一进度计数,日志通道由 TUI 持有。
+        // TUI 进度显示(feature `tui`):日志通道由配置注入或自动创建。
+        // 未开启 feature 或未配置时,进度为 None,零开销。
         #[cfg(feature = "tui")]
         let tui = self
             .config
@@ -198,68 +174,51 @@ impl ScenarioManager {
             .clone()
             .map(|mut options| (options.clone(), options.take_channel()));
 
-        let progress = self
-            .config
-            .progress
-            .map(|options| Progress::new(entry.name, plan, options, None));
+        #[cfg(feature = "tui")]
+        let progress: Option<Progress> = tui.as_ref().map(|(_options, channel)| {
+            let plan = match mode {
+                RunMode::Times(total) => ProgressPlan::Rounds(total),
+                RunMode::Duration(d) => ProgressPlan::Time(d),
+            };
+            Progress::new(entry.name, plan, Some(channel.clone()))
+        });
 
         #[cfg(feature = "tui")]
-        let progress = match tui.as_ref() {
-            Some((_options, channel)) => {
-                if progress.is_some() {
-                    panic!("with_progress 与 with_tui 互斥,请只启用其一");
-                }
-                Some(Progress::new(
-                    entry.name,
-                    plan,
-                    ProgressOptions::default(),
-                    Some(channel.clone()),
-                ))
-            }
-            None => progress,
-        };
-
-        // 渲染任务:单行或 TUI;未开启时为 None,零开销
-        #[cfg(feature = "tui")]
-        let progress_guard = match tui.as_ref() {
+        let progress_guard: Option<ProgressGuard> = match tui.as_ref() {
             Some((options, channel)) => progress
                 .as_ref()
                 .map(|p| p.start_tui(channel.clone(), options.clone(), shutdown.cloned())),
-            None => progress.as_ref().map(|p| p.start(shutdown.cloned())),
+            None => None,
         };
-        #[cfg(not(feature = "tui"))]
-        let progress_guard = progress.as_ref().map(|p| p.start(shutdown.cloned()));
+
+        let mk_config = |i: u64, mode: RunMode| RunnerConfig {
+            mode,
+            task_index: i as usize,
+            task_total: concurrency as usize,
+            shutdown: shutdown.cloned(),
+            #[cfg(feature = "tui")]
+            progress: progress.clone(),
+        };
 
         let cfgs: Vec<RunnerConfig> = match mode {
             RunMode::Times(total) => {
                 let base = total / concurrency;
                 let rem = total % concurrency;
                 (0..concurrency)
-                    .map(|i| RunnerConfig {
-                        mode: RunMode::Times(base + u64::from(i < rem)),
-                        task_index: i as usize,
-                        task_total: concurrency as usize,
-                        shutdown: shutdown.cloned(),
-                        progress: progress.clone(),
-                    })
+                    .map(|i| mk_config(i, RunMode::Times(base + u64::from(i < rem))))
                     .collect()
             }
             RunMode::Duration(d) => (0..concurrency)
-                .map(|i| RunnerConfig {
-                    mode: RunMode::Duration(d),
-                    task_index: i as usize,
-                    task_total: concurrency as usize,
-                    shutdown: shutdown.cloned(),
-                    progress: progress.clone(),
-                })
+                .map(|i| mk_config(i, RunMode::Duration(d)))
                 .collect(),
         };
 
         let futures: Vec<_> = cfgs.iter().map(|c| (entry.invoke)(ctx, c)).collect();
         let results = join_all(futures).await;
 
-        // 所有轮次结束后停止渲染,等最后一行写完,再交给调用方打印报告;
-        // 提前返回/取消的路径由守卫 drop 兜底停止。
+        // 所有轮次结束后停止渲染,等渲染任务收尾(恢复屏幕),
+        // 再交给调用方打印报告;提前返回/取消的路径由守卫 drop 兜底。
+        #[cfg(feature = "tui")]
         if let Some(guard) = progress_guard {
             guard.stop().await;
         }

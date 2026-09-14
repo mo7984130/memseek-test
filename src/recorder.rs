@@ -3,14 +3,17 @@ use std::{borrow::Cow, collections::HashMap, time::Duration};
 use hdrhistogram::Histogram;
 use tracing::warn;
 
-use crate::{error::ScenarioError, progress::Progress, runner::RunnerConfig};
+#[cfg(feature = "tui")]
+use crate::progress::Progress;
+use crate::{error::ScenarioError, runner::RunnerConfig};
 
 pub struct Recorder {
     histogram: Histogram<u64>,
     total: Duration,
 
-    /// 实时进度上报句柄(`None` 表示不上报);由 [`Recorder::from_config`] 注入。
+    /// 实时进度上报句柄(feature `tui`,由 [`Recorder::from_config`] 注入);
     /// 所有进度钩子汇集在此:报告统计与进度展示的数字同源。
+    #[cfg(feature = "tui")]
     progress: Option<Progress>,
 
     pub success: u64,
@@ -34,6 +37,7 @@ impl Recorder {
         Self {
             histogram: Histogram::new(3).unwrap(),
             total: Duration::ZERO,
+            #[cfg(feature = "tui")]
             progress: None,
             success: 0,
             failures: 0,
@@ -46,9 +50,10 @@ impl Recorder {
 
     /// 从运行配置创建:`RunnerConfig::progress` 存在时,后续 `record_*`
     /// 会同步累加实时进度计数。
-    pub fn from_config(config: &RunnerConfig) -> Self {
+    pub fn from_config(_config: &RunnerConfig) -> Self {
         Self {
-            progress: config.progress.clone(),
+            #[cfg(feature = "tui")]
+            progress: _config.progress.clone(),
             ..Self::new()
         }
     }
@@ -113,10 +118,14 @@ impl Recorder {
         self.interrupted |= other.interrupted;
         // 合并发生在所有轮次结束之后:汇合后的 Recorder 不再上报进度,
         // 避免误用时对共享计数二次累加
-        self.progress = None;
+        #[cfg(feature = "tui")]
+        {
+            self.progress = None;
+        }
     }
 
     /// 标记一轮 `run` 开始(实时进度的在途请求计数)。
+    #[cfg(feature = "tui")]
     pub fn begin_round(&mut self) {
         if let Some(progress) = &self.progress {
             progress.begin_round();
@@ -124,6 +133,7 @@ impl Recorder {
     }
 
     /// 标记一轮 `run` 结束。
+    #[cfg(feature = "tui")]
     pub fn end_round(&mut self) {
         if let Some(progress) = &self.progress {
             progress.end_round();
@@ -131,6 +141,7 @@ impl Recorder {
     }
 
     /// 标记进入任务级 `setup` 阶段。
+    #[cfg(feature = "tui")]
     pub fn begin_setup(&mut self) {
         if let Some(progress) = &self.progress {
             progress.begin_setup();
@@ -138,6 +149,7 @@ impl Recorder {
     }
 
     /// 标记退出任务级 `setup` 阶段。
+    #[cfg(feature = "tui")]
     pub fn end_setup(&mut self) {
         if let Some(progress) = &self.progress {
             progress.end_setup();
@@ -149,6 +161,7 @@ impl Recorder {
             .record(duration.as_micros() as u64)
             .expect("duration is out of histogram range");
         self.total += duration;
+        #[cfg(feature = "tui")]
         if let Some(progress) = &self.progress {
             progress.round_recorded();
         }
@@ -169,6 +182,7 @@ impl Recorder {
                     .or_insert(1);
             }
         }
+        #[cfg(feature = "tui")]
         if let Some(progress) = &self.progress {
             progress.result_recorded(result.is_ok());
         }
@@ -183,6 +197,7 @@ impl Recorder {
                 self.validate_failures += 1;
             }
         }
+        #[cfg(feature = "tui")]
         if let Some(progress) = &self.progress {
             progress.validate_recorded(validate_result);
         }
@@ -191,9 +206,11 @@ impl Recorder {
     /// 框架内部日志门面:TUI 激活时进日志缓冲(不再打扰终端),
     /// 否则照常落 tracing。
     pub(crate) fn log_internal(&self, message: String) {
-        if !self.progress.as_ref().is_some_and(|p| p.push_log(&message)) {
-            warn!("{message}");
+        #[cfg(feature = "tui")]
+        if self.progress.as_ref().is_some_and(|p| p.push_log(&message)) {
+            return;
         }
+        warn!("{message}");
     }
 
     /// 标记该任务因优雅关闭提前结束(计入报告)。

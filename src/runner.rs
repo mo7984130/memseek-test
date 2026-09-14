@@ -3,9 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "tui")]
+use crate::progress::Progress;
 use crate::{
     error::ScenarioError,
-    progress::Progress,
     recorder::Recorder,
     scenario::{Scenario, SetupMode},
     shutdown::Shutdown,
@@ -52,7 +53,8 @@ pub struct RunnerConfig {
     pub task_total: usize,
     /// 优雅关闭信号;触发后当前轮次完成即停止(不再启动新轮次)
     pub shutdown: Option<Shutdown>,
-    /// 实时进度上报句柄(由 Manager 注入);`None` 表示不上报
+    /// 实时进度上报句柄(feature `tui`,由 Manager 注入);`None` 表示不上报
+    #[cfg(feature = "tui")]
     pub progress: Option<Progress>,
 }
 
@@ -100,8 +102,10 @@ where
                 }
                 // setup 任务级一次(round 无轮次含义,固定 0),产出供各轮复用
                 let setup_task = TaskIndex::new(self.config.task_index, self.config.task_total, 0);
+                #[cfg(feature = "tui")]
                 recorder.begin_setup();
                 let setup = S::setup(ctx, &setup_task).await;
+                #[cfg(feature = "tui")]
                 recorder.end_setup();
                 let setup = match setup {
                     Ok(setup) => setup,
@@ -231,8 +235,10 @@ where
         recorder: &mut Recorder,
     ) -> Result<S::Output, S::Error> {
         let start = Instant::now();
+        #[cfg(feature = "tui")]
         recorder.begin_round();
         let result = S::run(ctx, task, setup).await;
+        #[cfg(feature = "tui")]
         recorder.end_round();
 
         recorder.record_duration(start.elapsed());
