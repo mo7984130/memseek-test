@@ -223,9 +223,20 @@ impl ScenarioManager {
             guard.stop().await;
         }
 
-        // TUI:渲染已恢复原屏幕,把日志缓冲回放到 stderr 补全档案
+        // TUI:渲染已恢复原屏幕;收到过停止信号时先给醒目提示,
+        // 再把日志缓冲回放到 stderr 补全档案
         #[cfg(feature = "tui")]
         if let Some((_, channel)) = tui.as_ref() {
+            if shutdown.is_some_and(|s| s.is_cancelled()) {
+                eprintln!(
+                    "{}",
+                    crate::report::paint(
+                        "^C received, graceful shutdown: finishing current rounds, report below",
+                        "1;33",
+                        true,
+                    )
+                );
+            }
             for line in channel.drain() {
                 eprintln!("{line}");
             }
