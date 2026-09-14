@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Deref;
 
 use crate::error::ScenarioError;
 use reqwest::{IntoUrl, Method, Response, StatusCode, Url};
@@ -112,6 +113,35 @@ impl ScenarioError for HttpError {
     }
 }
 
+/// 直接使用 `reqwest::Client` 时,`reqwest::Error` 也能参与报告错误分类
+/// (本地 trait 可为外部类型实现,孤儿规则允许)。
+///
+/// 状态码错误按 `http_status_{code}` 归类,传输层错误按原因细分,
+/// 与 [`HttpError`] 的分类保持一致。
+impl ScenarioError for reqwest::Error {
+    fn kind(&self) -> Cow<'static, str> {
+        if let Some(status) = self.status() {
+            return format!("http_status_{}", status.as_u16()).into();
+        }
+        if self.is_timeout() {
+            return "timeout".into();
+        }
+        if self.is_connect() {
+            return "connect".into();
+        }
+        if self.is_body() || self.is_decode() {
+            return "decode".into();
+        }
+        if self.is_redirect() {
+            return "redirect".into();
+        }
+        if self.is_request() || self.is_builder() {
+            return "request".into();
+        }
+        "reqwest".into()
+    }
+}
+
 /// 截断快照到最多 `max` 个字符,超出部分标注原文长度。
 fn truncate_log(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -122,37 +152,88 @@ fn truncate_log(s: &str, max: usize) -> String {
     }
 }
 
+/// 相对路径解析: 去掉前导 `/` 做相对拼接, 保留 base 的路径前缀(如 `/api`)。
+/// 传入完整 URL 时原样返回(没有前导 `/`)。
+pub fn resolve(base: &Url, path: &str) -> Result<Url, HttpError> {
+    Ok(base.join(path.trim_start_matches('/'))?)
+}
+
+/// 校验响应状态码:非 200 时读取响应体快照并返回 `HttpError::Status`。
+///
+/// 直接使用 `reqwest::Client` 时,用它替代 `error_for_status()`
+/// (后者会丢弃响应体,排障时看不到失败内容)。
+pub async fn check_status(
+    resp: Response,
+    method: Method,
+    capture: &CaptureOptions,
+) -> Result<Response, HttpError> {
+    if resp.status() == StatusCode::OK {
+        return Ok(resp);
+    }
+    let url = resp.url().clone();
+    Err(HttpError::from_response(resp, method, url, None, capture).await)
+}
+
+/// HTTP 客户端薄封装:统一 `base_url` 相对路径解析与失败响应内容快照。
+///
+/// reqwest 的完整能力(超时/连接池/TLS/代理/重定向等)不在此重复包装:
+/// 通过 [`Self::from_reqwest`] 传入自定义 `reqwest::Client`,或经 `Deref`
+/// 直接调用其方法。注意 `Deref` 暴露的方法是 reqwest 原生的,发起请求时
+/// 需要完整 URL(可先用 [`resolve`] 或 [`Self::resolve`] 拼接)。
 pub struct Client {
     pub base_url: reqwest::Url,
     inner: reqwest::Client,
     capture: CaptureOptions,
 }
 
+/// 保证 base 路径以 `/` 结尾,使相对拼接保留 path 前缀(如 `/api`)。
+fn normalize_base(mut base_url: Url) -> Url {
+    if !base_url.path().ends_with('/') {
+        let path = format!("{}/", base_url.path());
+        base_url.set_path(&path);
+    }
+    base_url
+}
+
 impl Client {
+    /// 使用 reqwest 默认配置(等价于 `reqwest::Client::new()`);
+    /// 需要自定义超时/连接池/TLS 时用 [`Self::from_reqwest`]。
     pub fn new(base_url: impl IntoUrl) -> Result<Self, HttpError> {
-        let mut base_url = base_url.into_url()?;
-        // 保证路径以 `/` 结尾, 使相对拼接保留 path 前缀(如 `/api`)
-        if !base_url.path().ends_with('/') {
-            let path = format!("{}/", base_url.path());
-            base_url.set_path(&path);
-        }
-        Ok(Self {
-            base_url,
-            inner: reqwest::Client::new(),
-            capture: CaptureOptions::default(),
-        })
+        Self::from_reqwest(reqwest::Client::new(), base_url)
     }
 
-    /// 解析请求路径: 去掉前导 `/` 做相对拼接, 保留 base 的路径前缀(如 `/api`)。
-    /// 传入完整 URL 时不受影响(前导无 `/`)。
-    fn resolve(&self, path: &str) -> Result<Url, HttpError> {
-        Ok(self.base_url.join(path.trim_start_matches('/'))?)
+    /// 用自定义的 `reqwest::Client` 构造, 底层能力(超时、连接池、
+    /// keep-alive、TLS、代理等)由调用方透过 `reqwest::Client::builder()` 配置。
+    pub fn from_reqwest(inner: reqwest::Client, base_url: impl IntoUrl) -> Result<Self, HttpError> {
+        Ok(Self {
+            base_url: normalize_base(base_url.into_url()?),
+            inner,
+            capture: CaptureOptions::default(),
+        })
     }
 
     /// 链式设置请求/响应内容捕获(默认开启,截断 512 字符;`0` 关闭)。
     pub fn with_capture(mut self, capture: CaptureOptions) -> Self {
         self.capture = capture;
         self
+    }
+
+    /// 底层 `reqwest::Client` 访问器,用于绕过本封装使用其完整 API。
+    /// 注意其方法需要完整 URL;相对路径请先用 [`Self::resolve`] 拼接。
+    pub fn inner(&self) -> &reqwest::Client {
+        &self.inner
+    }
+
+    /// 解析请求路径: 去掉前导 `/` 做相对拼接, 保留 base 的路径前缀(如 `/api`)。
+    /// 传入完整 URL 时原样返回。
+    pub fn resolve(&self, path: &str) -> Result<Url, HttpError> {
+        resolve(&self.base_url, path)
+    }
+
+    /// 唯一请求入口: 链式配置后以 [`RequestBuilder::send`] /
+    /// [`RequestBuilder::send_checked`] 发送。相对路径自动拼接 `base_url`。
+    pub fn request(&self, method: reqwest::Method, url: &str) -> RequestBuilder<'_> {
+        RequestBuilder::new(self, method, url)
     }
 
     /// 请求体快照(开关开启时),否则 `None`。
@@ -166,292 +247,20 @@ impl Client {
             ))
         }
     }
+}
 
-    /// GET 请求:状态码非 200 时直接返回 `HttpError::Status`(压测默认行为)。
-    /// 需要读取非 200 响应体时,用 [`Self::get_raw`]。
-    pub async fn get(&self, url: &str) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let resp = self.inner.get(url.clone()).send().await?;
-        if resp.status() != StatusCode::OK {
-            return Err(
-                HttpError::from_response(resp, Method::GET, url, None, &self.capture).await,
-            );
-        }
-        Ok(resp)
-    }
+impl Deref for Client {
+    type Target = reqwest::Client;
 
-    /// GET 请求:原样返回响应(不校验状态码)。
-    pub async fn get_raw(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.inner.get(self.resolve(url)?).send().await?;
-        Ok(resp)
-    }
-
-    /// POST 请求:状态码非 200 时返回错误。
-    /// `body` 接受任意 `Serialize` 值(如 `json!({...})` 或 `&Struct`)。
-    pub async fn post(
-        &self,
-        url: &str,
-        body: impl serde::Serialize,
-    ) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let bytes = serde_json::to_vec(&body)?;
-        let request_body = self.capture_body(&bytes);
-        let resp = self
-            .inner
-            .post(url.clone())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(bytes)
-            .send()
-            .await?;
-        if resp.status() != StatusCode::OK {
-            return Err(HttpError::from_response(
-                resp,
-                Method::POST,
-                url,
-                request_body,
-                &self.capture,
-            )
-            .await);
-        }
-        Ok(resp)
-    }
-
-    /// POST 请求:原样返回响应(不校验状态码)。
-    pub async fn post_raw(
-        &self,
-        url: &str,
-        body: impl serde::Serialize,
-    ) -> Result<Response, HttpError> {
-        let resp = self
-            .inner
-            .post(self.resolve(url)?)
-            .json(&body)
-            .send()
-            .await?;
-        Ok(resp)
-    }
-
-    /// POST 请求:发送表单数据。
-    pub async fn post_form(
-        &self,
-        url: &str,
-        form: &[(String, String)],
-    ) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let encoded = serde_urlencoded::to_string(form)
-            .map_err(|e| serde_json::Error::custom(e.to_string()))?;
-        let request_body = self.capture_body(encoded.as_bytes());
-        let resp = self
-            .inner
-            .post(url.clone())
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(encoded)
-            .send()
-            .await?;
-        if resp.status() != StatusCode::OK {
-            return Err(HttpError::from_response(
-                resp,
-                Method::POST,
-                url,
-                request_body,
-                &self.capture,
-            )
-            .await);
-        }
-        Ok(resp)
-    }
-
-    /// POST 请求:发送 multipart/form-data 表单(文件上传等)。
-    /// 状态码非 200 时返回错误;二进制内容不做文本快照。
-    /// 用 [`multipart::Form`](reqwest::multipart::Form) 构造表单项。
-    pub async fn post_multipart(
-        &self,
-        url: &str,
-        form: reqwest::multipart::Form,
-    ) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let resp = self.inner.post(url.clone()).multipart(form).send().await?;
-        if resp.status() != StatusCode::OK {
-            return Err(
-                HttpError::from_response(resp, Method::POST, url, None, &self.capture).await,
-            );
-        }
-        Ok(resp)
-    }
-
-    /// POST 请求:发送 multipart/form-data 表单,原样返回响应(不校验状态码)。
-    pub async fn post_multipart_raw(
-        &self,
-        url: &str,
-        form: reqwest::multipart::Form,
-    ) -> Result<Response, HttpError> {
-        let resp = self
-            .inner
-            .post(self.resolve(url)?)
-            .multipart(form)
-            .send()
-            .await?;
-        Ok(resp)
-    }
-
-    /// PUT 请求:状态码非 200 时返回错误。
-    /// `body` 接受任意 `Serialize` 值(如 `json!({...})` 或 `&Struct`)。
-    pub async fn put(&self, url: &str, body: impl serde::Serialize) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let bytes = serde_json::to_vec(&body)?;
-        let request_body = self.capture_body(&bytes);
-        let resp = self
-            .inner
-            .put(url.clone())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(bytes)
-            .send()
-            .await?;
-        if resp.status() != StatusCode::OK {
-            return Err(HttpError::from_response(
-                resp,
-                Method::PUT,
-                url,
-                request_body,
-                &self.capture,
-            )
-            .await);
-        }
-        Ok(resp)
-    }
-
-    /// PUT 请求:原样返回响应(不校验状态码)。
-    pub async fn put_raw(
-        &self,
-        url: &str,
-        body: impl serde::Serialize,
-    ) -> Result<Response, HttpError> {
-        let resp = self
-            .inner
-            .put(self.resolve(url)?)
-            .json(&body)
-            .send()
-            .await?;
-        Ok(resp)
-    }
-
-    /// DELETE 请求:状态码非 200 时返回错误。
-    pub async fn delete(&self, url: &str) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let resp = self.inner.delete(url.clone()).send().await?;
-        if resp.status() != StatusCode::OK {
-            return Err(
-                HttpError::from_response(resp, Method::DELETE, url, None, &self.capture).await,
-            );
-        }
-        Ok(resp)
-    }
-
-    /// DELETE 请求:原样返回响应(不校验状态码)。
-    pub async fn delete_raw(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.inner.delete(self.resolve(url)?).send().await?;
-        Ok(resp)
-    }
-
-    /// PATCH 请求:状态码非 200 时返回错误。
-    /// `body` 接受任意 `Serialize` 值(如 `json!({...})` 或 `&Struct`)。
-    pub async fn patch(
-        &self,
-        url: &str,
-        body: impl serde::Serialize,
-    ) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let bytes = serde_json::to_vec(&body)?;
-        let request_body = self.capture_body(&bytes);
-        let resp = self
-            .inner
-            .patch(url.clone())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(bytes)
-            .send()
-            .await?;
-        if resp.status() != StatusCode::OK {
-            return Err(HttpError::from_response(
-                resp,
-                Method::PATCH,
-                url,
-                request_body,
-                &self.capture,
-            )
-            .await);
-        }
-        Ok(resp)
-    }
-
-    /// PATCH 请求:原样返回响应(不校验状态码)。
-    pub async fn patch_raw(
-        &self,
-        url: &str,
-        body: impl serde::Serialize,
-    ) -> Result<Response, HttpError> {
-        let resp = self
-            .inner
-            .patch(self.resolve(url)?)
-            .json(&body)
-            .send()
-            .await?;
-        Ok(resp)
-    }
-
-    /// OPTIONS 请求:状态码非 200 时返回错误。
-    pub async fn options(&self, url: &str) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let resp = self
-            .inner
-            .request(Method::OPTIONS, url.clone())
-            .send()
-            .await?;
-        if resp.status() != StatusCode::OK {
-            return Err(
-                HttpError::from_response(resp, Method::OPTIONS, url, None, &self.capture).await,
-            );
-        }
-        Ok(resp)
-    }
-
-    /// OPTIONS 请求:原样返回响应(不校验状态码)。
-    pub async fn options_raw(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self
-            .inner
-            .request(reqwest::Method::OPTIONS, self.resolve(url)?)
-            .send()
-            .await?;
-        Ok(resp)
-    }
-
-    /// HEAD 请求:状态码非 200 时返回错误。
-    pub async fn head(&self, url: &str) -> Result<Response, HttpError> {
-        let url = self.resolve(url)?;
-        let resp = self.inner.head(url.clone()).send().await?;
-        if resp.status() != StatusCode::OK {
-            return Err(
-                HttpError::from_response(resp, Method::HEAD, url, None, &self.capture).await,
-            );
-        }
-        Ok(resp)
-    }
-
-    /// HEAD 请求:原样返回响应(不校验状态码)。
-    pub async fn head_raw(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.inner.head(self.resolve(url)?).send().await?;
-        Ok(resp)
-    }
-
-    /// 创建一个自定义请求构建器
-    pub fn request(&self, method: reqwest::Method, url: &str) -> RequestBuilder<'_> {
-        RequestBuilder::new(self, method, url)
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
 /// 自定义请求构建器,支持更灵活的配置。
+///
+/// 与 `reqwest::RequestBuilder` 的区别:相对路径自动拼接 `base_url`,
+/// `send_checked` 会把非 200 响应转成带内容快照的 [`HttpError::Status`]。
 pub struct RequestBuilder<'a> {
     client: &'a Client,
     method: reqwest::Method,
@@ -580,6 +389,7 @@ impl<'a> RequestBuilder<'a> {
         req_builder.send().await.map_err(HttpError::from)
     }
 
+    /// 发送请求,原样返回响应(不校验状态码)。
     pub async fn send(self) -> Result<Response, HttpError> {
         let RequestBuilder {
             client,
@@ -595,7 +405,8 @@ impl<'a> RequestBuilder<'a> {
         Self::send_impl(client, method, full_url, headers, query, body, multipart).await
     }
 
-    /// 发送请求并自动检查状态码(自动捕获请求/响应内容快照)
+    /// 发送请求并自动检查状态码:非 200 时自动捕获请求/响应内容快照
+    /// 并返回 [`HttpError::Status`],便于压测报告按状态码分类统计。
     pub async fn send_checked(self) -> Result<Response, HttpError> {
         let RequestBuilder {
             client,
@@ -634,17 +445,21 @@ impl<'a> RequestBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::Client;
+    use super::{Client, resolve};
 
-    fn resolve(base: &str, path: &str) -> String {
-        Client::new(base).unwrap().resolve(path).unwrap().to_string()
+    fn base_url(base: &str) -> reqwest::Url {
+        Client::new(base).unwrap().base_url
+    }
+
+    fn resolve_url(base: &str, path: &str) -> String {
+        resolve(&base_url(base), path).unwrap().to_string()
     }
 
     #[test]
     fn keep_base_path_prefix() {
         // 带路径前缀的 base(如 /api): 前导 / 的请求路径应保留前缀
         assert_eq!(
-            resolve("https://memory-seek.driftcloud.cn/api", "/auth/login"),
+            resolve_url("https://memory-seek.driftcloud.cn/api", "/auth/login"),
             "https://memory-seek.driftcloud.cn/api/auth/login"
         );
     }
@@ -652,7 +467,7 @@ mod tests {
     #[test]
     fn no_prefix_unchanged() {
         assert_eq!(
-            resolve("http://127.0.0.1:7985", "/auth/login"),
+            resolve_url("http://127.0.0.1:7985", "/auth/login"),
             "http://127.0.0.1:7985/auth/login"
         );
     }
@@ -660,7 +475,10 @@ mod tests {
     #[test]
     fn query_preserved() {
         assert_eq!(
-            resolve("http://localhost:8025", "/api/v2/messages?limit=100&order=desc"),
+            resolve_url(
+                "http://localhost:8025",
+                "/api/v2/messages?limit=100&order=desc"
+            ),
             "http://localhost:8025/api/v2/messages?limit=100&order=desc"
         );
     }
@@ -668,7 +486,7 @@ mod tests {
     #[test]
     fn absolute_url_passthrough() {
         assert_eq!(
-            resolve("http://127.0.0.1:7985", "https://other.example/x"),
+            resolve_url("http://127.0.0.1:7985", "https://other.example/x"),
             "https://other.example/x"
         );
     }

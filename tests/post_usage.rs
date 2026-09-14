@@ -1,4 +1,5 @@
-use memseek_test::ctxlibs::http_client::{CaptureOptions, Client, HttpError};
+use memseek_test::ctxlibs::http_client::{CaptureOptions, Client, HttpError, check_status};
+use memseek_test::error::ScenarioError;
 use reqwest::Method;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -64,7 +65,9 @@ fn status_error_captures_request_and_response_body() {
         let base = fake_server_400("{\"error\":\"bad email\"}").await;
         let client = Client::new(&base).unwrap();
         let err = client
-            .post("/auth/register", json!({ "email": "x@y.z" }))
+            .request(reqwest::Method::POST, "/auth/register")
+            .json_unwrap(&json!({ "email": "x@y.z" }))
+            .send_checked()
             .await
             .unwrap_err();
         match err {
@@ -100,7 +103,9 @@ fn capture_disabled_skips_body() {
             .unwrap()
             .with_capture(CaptureOptions::disabled());
         let err = client
-            .post("/auth/register", json!({ "email": "x@y.z" }))
+            .request(reqwest::Method::POST, "/auth/register")
+            .json_unwrap(&json!({ "email": "x@y.z" }))
+            .send_checked()
             .await
             .unwrap_err();
         match err {
@@ -123,7 +128,11 @@ fn response_read_failure_is_preserved_as_error() {
     rt.block_on(async {
         let base = fake_server_truncated_body().await;
         let client = Client::new(&base).unwrap();
-        let err = client.get("/x").await.unwrap_err();
+        let err = client
+            .request(reqwest::Method::GET, "/x")
+            .send_checked()
+            .await
+            .unwrap_err();
         match err {
             HttpError::Status {
                 status,
@@ -139,33 +148,149 @@ fn response_read_failure_is_preserved_as_error() {
 }
 
 #[test]
-fn post_accepts_json_value_directly() {
+fn deref_exposes_reqwest_client() {
+    // 编译期验证: Client 经 Deref 可用作 reqwest::Client
+    fn takes_reqwest(_: &reqwest::Client) {}
+    let client = Client::new("http://127.0.0.1:1").unwrap();
+    takes_reqwest(&client);
+}
+
+#[test]
+fn reqwest_error_kind_classifies_connect() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async {
-        let client = Client::new("http://127.0.0.1:1").unwrap();
-        // 用户期望的写法:直接传 json! 的值(不再需要 &)
-        // 连接 localhost:1 会失败,这里只验证编译与签名兼容
-        let _ = client
-            .post("/auth/login", json!({ "username": "x", "password": "y" }))
-            .await;
+        // 无法连接(127.0.0.1:1 拒绝连接): 裸 reqwest::Error 也能分类
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/x")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "connect");
     });
 }
 
 #[test]
-fn post_still_accepts_reference() {
+fn reqwest_error_kind_classifies_status() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async {
-        let client = Client::new("http://127.0.0.1:1").unwrap();
-        // 传引用的旧用法仍然兼容
-        let _ = client
-            .post("/auth/login", &json!({ "username": "x" }))
-            .await;
+        let base = fake_server_400("{\"error\":\"bad email\"}").await;
+        // error_for_status 丢弃响应体但保留状态码: 分类为 http_status_400
+        let err = reqwest::Client::new()
+            .get(format!("{base}/x"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        assert_eq!(err.kind(), "http_status_400");
+    });
+}
+
+#[test]
+fn check_status_passthrough_ok() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let base = fake_server_echo().await;
+        let client = Client::new(&base).unwrap();
+        // 直接使用底层 reqwest::Client + 自由函数 check_status
+        let resp = client
+            .get(client.resolve("/ok").unwrap())
+            .send()
+            .await
+            .unwrap();
+        let resp = check_status(resp, reqwest::Method::GET, &CaptureOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    });
+}
+
+#[test]
+fn check_status_captures_error_body() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let base = fake_server_400("{\"error\":\"bad email\"}").await;
+        let client = Client::new(&base).unwrap();
+        let resp = client
+            .get(client.resolve("/x").unwrap())
+            .send()
+            .await
+            .unwrap();
+        let err = check_status(resp, reqwest::Method::GET, &CaptureOptions::default())
+            .await
+            .unwrap_err();
+        match err {
+            HttpError::Status {
+                status,
+                response_body: Some(Ok(text)),
+                ..
+            } => {
+                assert_eq!(status.as_u16(), 400);
+                assert!(text.contains("bad email"), "{text}");
+            }
+            other => panic!("期望 Status + 响应体快照, 实际: {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn from_reqwest_applies_custom_timeout() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        // 假服务器: 收到请求后睡 500ms 再响应
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = sock.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            let _ = writer.write_all(resp.as_bytes()).await;
+        });
+        let base = format!("http://{addr}");
+
+        // 50ms 超时: 原来 Client::new 无法配置, 现在经 from_reqwest 生效
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let client = Client::from_reqwest(http, &base).unwrap();
+
+        let err = client
+            .request(reqwest::Method::GET, "/slow")
+            .send()
+            .await
+            .unwrap_err();
+        match err {
+            HttpError::Reqwest(e) => {
+                assert!(e.is_timeout(), "期望超时, 实际: {e}");
+                assert_eq!(e.kind(), "timeout");
+            }
+            other => panic!("期望 Reqwest 传输错误, 实际: {other:?}"),
+        }
     });
 }
 
@@ -237,7 +362,9 @@ fn post_multipart_sends_form_data() {
         let client = Client::new(&base).unwrap();
 
         let resp = client
-            .post_multipart("/upload", build_form())
+            .request(reqwest::Method::POST, "/upload")
+            .multipart(build_form())
+            .send_checked()
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
