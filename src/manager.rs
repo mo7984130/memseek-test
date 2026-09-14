@@ -125,19 +125,22 @@ impl ScenarioManager {
         shutdown: Option<&Shutdown>,
     ) -> Vec<ScenarioReport> {
         let mut reports = Vec::with_capacity(scenarios.len());
-        for s in scenarios {
+        for (i, s) in scenarios.iter().enumerate() {
             // 优雅关闭:信号已触发则不再启动下一个场景
             if shutdown.is_some_and(|s| s.is_cancelled()) {
                 break;
             }
-            reports.push(self.run_entry(s, ctx, shutdown).await);
+            reports.push(self.run_entry(s, ctx, shutdown, i, scenarios.len()).await);
         }
         reports
     }
 
     pub async fn run_one<Ctx: Any + Sync>(&self, name: &str, ctx: &Ctx) -> Option<ScenarioReport> {
         let s = ScenarioRegistry::find::<Ctx>(name)?;
-        Some(self.run_entry(s, ctx, self.config.shutdown.as_ref()).await)
+        Some(
+            self.run_entry(s, ctx, self.config.shutdown.as_ref(), 0, 1)
+                .await,
+        )
     }
 
     /// 同 [`Self::run_one`],但以显式传入的关闭信号替代 `ManagerConfig` 中绑定的信号。
@@ -148,7 +151,7 @@ impl ScenarioManager {
         shutdown: Shutdown,
     ) -> Option<ScenarioReport> {
         let s = ScenarioRegistry::find::<Ctx>(name)?;
-        Some(self.run_entry(s, ctx, Some(&shutdown)).await)
+        Some(self.run_entry(s, ctx, Some(&shutdown), 0, 1).await)
     }
 
     async fn run_entry(
@@ -156,6 +159,8 @@ impl ScenarioManager {
         entry: &ScenarioRegistration,
         ctx: &dyn Any,
         shutdown: Option<&Shutdown>,
+        scenario_index: usize,
+        scenario_total: usize,
     ) -> ScenarioReport {
         let mode = self
             .config
@@ -180,7 +185,13 @@ impl ScenarioManager {
                 RunMode::Times(total) => ProgressPlan::Rounds(total),
                 RunMode::Duration(d) => ProgressPlan::Time(d),
             };
-            Progress::new(entry.name, plan, Some(channel.clone()))
+            Progress::new(
+                entry.name,
+                plan,
+                Some(channel.clone()),
+                scenario_index,
+                scenario_total,
+            )
         });
 
         #[cfg(feature = "tui")]

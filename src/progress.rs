@@ -130,6 +130,9 @@ pub struct Progress {
 struct Inner {
     name: Cow<'static, str>,
     plan: ProgressPlan,
+    /// 当前场景序号(0 起)与场景总数;`total <= 1` 时不显示 `[n/N]`
+    scenario_index: usize,
+    scenario_total: usize,
     started: Instant,
     /// 已完成轮数(与报告 `times` 对齐:由 `record_duration` 累加)
     rounds: AtomicU64,
@@ -150,11 +153,15 @@ impl Progress {
         name: impl Into<Cow<'static, str>>,
         plan: ProgressPlan,
         log: Option<LogChannel>,
+        scenario_index: usize,
+        scenario_total: usize,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 name: name.into(),
                 plan,
+                scenario_index,
+                scenario_total,
                 started: Instant::now(),
                 rounds: AtomicU64::new(0),
                 failures: AtomicU64::new(0),
@@ -299,9 +306,18 @@ impl Drop for ProgressGuard {
 const NAME_WIDTH: usize = 20;
 
 /// 组装进度行文本(纯函数,便于测试);供 TUI 帧渲染使用。
+/// 多场景时带 `[n/N]` 前缀(单场景不显示)。
 fn render_line(inner: &Inner, stopping: bool, color: bool, bar_width: usize) -> String {
     let name = fit_name(&inner.name);
     let mut line = String::with_capacity(128);
+    if inner.scenario_total > 1 {
+        let _ = write!(
+            line,
+            "[{}/{}] ",
+            inner.scenario_index + 1,
+            inner.scenario_total
+        );
+    }
 
     // setup 阶段(仅 Task 粒度):轮数尚未开始
     if inner.in_setup.load(Ordering::Relaxed) > 0 {
@@ -392,7 +408,7 @@ mod tests {
 
     #[test]
     fn line_shows_rounds_percent_and_rate() {
-        let p = Progress::new("login", ProgressPlan::Rounds(1000), None);
+        let p = Progress::new("login", ProgressPlan::Rounds(1000), None, 1, 3);
         for _ in 0..250 {
             p.round_recorded();
         }
@@ -400,6 +416,7 @@ mod tests {
 
         let line = render_line(&p.inner, false, false, 20);
         assert!(line.contains("login"), "{line}");
+        assert!(line.contains("[2/3]"), "{line}");
         assert!(line.contains("25.0%"), "{line}");
         assert!(line.contains("250/1000"), "{line}");
         assert!(line.contains("req/s"), "{line}");
@@ -413,10 +430,11 @@ mod tests {
 
     #[test]
     fn line_reports_setup_phase_and_stopping() {
-        let p = Progress::new("scn", ProgressPlan::Rounds(10), None);
+        let p = Progress::new("scn", ProgressPlan::Rounds(10), None, 0, 2);
         p.begin_setup();
         let line = render_line(&p.inner, false, false, 20);
         assert!(line.contains("setup..."), "{line}");
+        assert!(line.contains("[1/2]"), "{line}");
         assert!(!line.contains("req/s"), "{line}");
 
         p.end_setup();
@@ -428,7 +446,13 @@ mod tests {
 
     #[test]
     fn duration_plan_uses_elapsed_over_planned() {
-        let p = Progress::new("dur", ProgressPlan::Time(Duration::from_secs(600)), None);
+        let p = Progress::new(
+            "dur",
+            ProgressPlan::Time(Duration::from_secs(600)),
+            None,
+            0,
+            1,
+        );
         let line = render_line(&p.inner, false, false, 20);
         assert!(line.contains("0.0%"), "{line}");
         assert!(line.contains("/600.00s"), "{line}");
@@ -440,14 +464,24 @@ mod tests {
             "a_very_long_scenario_name_indeed",
             ProgressPlan::Rounds(1),
             None,
+            0,
+            3,
         );
         let line = render_line(&p.inner, false, false, 20);
-        assert!(line.starts_with("a_very_long_scenari…"), "{line}");
+        assert!(line.starts_with("[1/3] a_very_long_scenari…"), "{line}");
+    }
+
+    #[test]
+    fn single_scenario_hides_index_badge() {
+        let p = Progress::new("only", ProgressPlan::Rounds(1), None, 0, 1);
+        let line = render_line(&p.inner, false, false, 20);
+        assert!(!line.contains("[1/1]"), "单场景不应显示序号: {line}");
+        assert!(line.starts_with("only"), "{line}");
     }
 
     #[test]
     fn color_option_paints_failures() {
-        let p = Progress::new("scn", ProgressPlan::Rounds(1), None);
+        let p = Progress::new("scn", ProgressPlan::Rounds(1), None, 0, 1);
         p.result_recorded(false);
         let line = render_line(&p.inner, false, true, 20);
         assert!(line.contains("\x1b[31mfail 1\x1b[0m"), "{line}");
@@ -474,7 +508,7 @@ mod tests {
     #[test]
     fn push_log_prefixes_time_in_tui_mode() {
         let channel = LogChannel::with_capacity(10);
-        let p = Progress::new("s", ProgressPlan::Rounds(1), Some(channel.clone()));
+        let p = Progress::new("s", ProgressPlan::Rounds(1), Some(channel.clone()), 0, 1);
         assert!(p.push_log("boom"));
         let lines = channel.lines();
         assert_eq!(lines.len(), 1);
@@ -482,7 +516,7 @@ mod tests {
         assert!(lines[0].ends_with("boom]"), "{lines:?}");
 
         // 无日志通道时返回 false,调用方走 tracing 兜底
-        let p = Progress::new("s", ProgressPlan::Rounds(1), None);
+        let p = Progress::new("s", ProgressPlan::Rounds(1), None, 0, 1);
         assert!(!p.push_log("x"));
     }
 }
