@@ -15,10 +15,11 @@
 
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     fmt::Write as _,
     io::IsTerminal,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -57,7 +58,81 @@ impl Default for ProgressOptions {
     }
 }
 
-/// 进度计划的计量基准。
+/// 日志环形缓冲(TUI 模式的日志区数据源)。
+///
+/// 实现 [`std::io::Write`](https://doc.rust-lang.org/std/io/trait.Write.html):
+/// 按行切分入队,超容量丢弃最旧;`Clone` 共享同一缓冲。
+/// 配合 feature `tui` 的 [`crate::tui::TuiOptions`] 使用:
+/// 也可作为 `tracing_subscriber::fmt::layer().with_writer(channel)`
+/// 的 writer,把业务日志接入日志区。
+#[derive(Clone, Debug)]
+pub struct LogChannel {
+    inner: Arc<Mutex<LogBuf>>,
+}
+
+#[derive(Debug)]
+struct LogBuf {
+    lines: VecDeque<String>,
+    max_lines: usize,
+}
+
+impl Default for LogChannel {
+    fn default() -> Self {
+        Self::with_capacity(200)
+    }
+}
+
+impl LogChannel {
+    /// 创建环形缓冲,最多保留 `max_lines` 行。
+    pub fn with_capacity(max_lines: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LogBuf {
+                lines: VecDeque::with_capacity(max_lines.min(1024)),
+                max_lines,
+            })),
+        }
+    }
+
+    /// 推送一行(内部会去掉行尾换行)。
+    pub fn push_line(&self, line: impl Into<String>) {
+        let mut buf = self.inner.lock().unwrap();
+        let line = line.into();
+        let line = line.strip_suffix('\n').unwrap_or(&line).to_string();
+        if buf.lines.len() == buf.max_lines {
+            buf.lines.pop_front();
+        }
+        buf.lines.push_back(line);
+    }
+
+    /// 当前缓冲内容(旧→新)。
+    pub fn lines(&self) -> Vec<String> {
+        self.inner.lock().unwrap().lines.iter().cloned().collect()
+    }
+
+    /// 取出全部内容并清空(用于 TUI 退出后的日志回放)。
+    pub fn drain(&self) -> Vec<String> {
+        let mut buf = self.inner.lock().unwrap();
+        buf.lines.drain(..).collect()
+    }
+}
+
+impl std::io::Write for LogChannel {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        for line in text.split('\n') {
+            if !line.is_empty() {
+                self.push_line(line);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 进度计划(Manager 解析 `RunMode` 后注入)。
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ProgressPlan {
     /// 总轮数(`RunMode::Times`)
@@ -92,6 +167,8 @@ struct Inner {
     in_setup: AtomicU64,
     /// 渲染循环停止标志
     stop: AtomicBool,
+    /// TUI 模式的日志缓冲(单行模式为 `None` 不采集)
+    log: Option<LogChannel>,
 }
 
 impl Progress {
@@ -99,6 +176,7 @@ impl Progress {
         name: impl Into<Cow<'static, str>>,
         plan: ProgressPlan,
         options: ProgressOptions,
+        log: Option<LogChannel>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -112,9 +190,11 @@ impl Progress {
                 in_flight: AtomicU64::new(0),
                 in_setup: AtomicU64::new(0),
                 stop: AtomicBool::new(false),
+                log,
             }),
         }
     }
+    // ---------- 热路径钩子(由 Recorder / ScenarioRunner 调用) ----------
 
     /// 启动渲染任务(须在 Tokio runtime 内调用),返回停止守卫。
     /// stderr 非 TTY 且未 `force` 时返回不渲染的空守卫。
@@ -126,6 +206,53 @@ impl Progress {
             };
         }
         self.spawn(std::io::stderr(), shutdown)
+    }
+
+    /// TUI 模式渲染任务(feature `tui`,须在 Tokio runtime 内调用)。
+    /// 进入 alternate screen 全屏渲染:顶部进度行 + 日志区;
+    /// 停止时恢复原屏幕。非 TTY 时返回不渲染的空守卫。
+    #[cfg(feature = "tui")]
+    pub(crate) fn start_tui(
+        &self,
+        channel: crate::LogChannel,
+        options: crate::tui::TuiOptions,
+        shutdown: Option<Shutdown>,
+    ) -> ProgressGuard {
+        if !std::io::stderr().is_terminal() {
+            return ProgressGuard {
+                inner: Arc::clone(&self.inner),
+                handle: None,
+            };
+        }
+        let inner = Arc::clone(&self.inner);
+        let task_inner = Arc::clone(&inner);
+        let handle = tokio::spawn(async move {
+            let mut writer = std::io::stderr();
+            // 进入 alternate screen
+            let _ = std::io::Write::write(&mut writer, b"\x1b[?1049h");
+            let _ = std::io::Write::flush(&mut writer);
+            loop {
+                let stopping = shutdown.as_ref().is_some_and(|s| s.is_cancelled());
+                let line = render_line(&task_inner, stopping);
+                let frame = crate::tui::render_frame(&line, &channel, &options);
+                // 回到左上角后清屏重绘,避免残留
+                let text = format!("\x1b[H\x1b[2J{frame}");
+                let _ = std::io::Write::write(&mut writer, text.as_bytes());
+                let _ = std::io::Write::flush(&mut writer);
+
+                if task_inner.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(options.refresh).await;
+            }
+            // 恢复原屏幕
+            let _ = std::io::Write::write(&mut writer, b"\x1b[?1049l");
+            let _ = std::io::Write::flush(&mut writer);
+        });
+        ProgressGuard {
+            inner,
+            handle: Some(handle),
+        }
     }
 
     /// 渲染循环(出口可替换,便于测试断言输出内容)。
@@ -197,6 +324,16 @@ impl Progress {
     pub(crate) fn validate_recorded(&self, ok: bool) {
         if !ok {
             self.inner.validate_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 框架内部日志进 TUI 日志缓冲(带时间前缀);无缓冲(单行模式)时返回 `false`,由调用方落 tracing。
+    pub(crate) fn push_log(&self, line: &str) -> bool {
+        if let Some(channel) = &self.inner.log {
+            channel.push_line(format!("[{} {line}]", now_hms()));
+            true
+        } else {
+            false
         }
     }
 }
@@ -302,6 +439,16 @@ fn ratio(done: u64, total: u64) -> f64 {
     (done as f64 / total as f64).clamp(0.0, 1.0)
 }
 
+/// 当前本地时间 `HH:MM:SS`(用于框架日志的时间前缀)
+fn now_hms() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (h, m, s) = (now / 3600 % 24, now / 60 % 60, now % 60);
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
 /// 累计平均吞吐(attempts / 已用时),计 0 或耗时过短时返回 0
 fn rate(rounds: u64, elapsed: Duration) -> u64 {
     let secs = elapsed.as_secs_f64();
@@ -351,6 +498,7 @@ mod tests {
             "login",
             ProgressPlan::Rounds(1000),
             ProgressOptions::default(),
+            None,
         );
         for _ in 0..250 {
             p.round_recorded();
@@ -372,7 +520,12 @@ mod tests {
 
     #[test]
     fn line_reports_setup_phase_and_stopping() {
-        let p = Progress::new("scn", ProgressPlan::Rounds(10), ProgressOptions::default());
+        let p = Progress::new(
+            "scn",
+            ProgressPlan::Rounds(10),
+            ProgressOptions::default(),
+            None,
+        );
         p.begin_setup();
         let line = render_line(&p.inner, false);
         assert!(line.contains("setup..."), "{line}");
@@ -391,6 +544,7 @@ mod tests {
             "dur",
             ProgressPlan::Time(Duration::from_secs(600)),
             ProgressOptions::default(),
+            None,
         );
         let line = render_line(&p.inner, false);
         assert!(line.contains("0.0%"), "{line}");
@@ -403,6 +557,7 @@ mod tests {
             "a_very_long_scenario_name_indeed",
             ProgressPlan::Rounds(1),
             ProgressOptions::default(),
+            None,
         );
         let line = render_line(&p.inner, false);
         assert!(line.starts_with("a_very_long_scenari…"), "{line}");
@@ -417,6 +572,7 @@ mod tests {
                 color: true,
                 ..ProgressOptions::default()
             },
+            None,
         );
         p.result_recorded(false);
         let line = render_line(&p.inner, false);
@@ -433,6 +589,7 @@ mod tests {
                 refresh: Duration::from_millis(5),
                 ..ProgressOptions::default()
             },
+            None,
         );
         runtime().block_on(async {
             let guard = p.spawn(buf.clone(), None);
@@ -457,11 +614,59 @@ mod tests {
         if std::io::stderr().is_terminal() {
             return;
         }
-        let p = Progress::new("scn", ProgressPlan::Rounds(4), ProgressOptions::default());
+        let p = Progress::new(
+            "scn",
+            ProgressPlan::Rounds(4),
+            ProgressOptions::default(),
+            None,
+        );
         runtime().block_on(async {
             let guard = p.start(None);
             assert!(guard.handle.is_none(), "未 force 的非 TTY 环境不应渲染");
             guard.stop().await;
         });
+    }
+
+    #[test]
+    fn log_channel_ring_buffer_and_write() {
+        let mut channel = LogChannel::with_capacity(3);
+        channel.push_line("a");
+        channel.push_line("b");
+        channel.push_line("c");
+        channel.push_line("d"); // 超容量丢最旧
+        assert_eq!(channel.lines(), vec!["b", "c", "d"]);
+
+        // io::Write 按行切分,行尾换行不残留
+        std::io::Write::write_all(&mut channel, b"e\nf\n").unwrap();
+        assert_eq!(channel.lines(), vec!["d", "e", "f"]);
+
+        // drain 取出并清空
+        assert_eq!(channel.drain(), vec!["d", "e", "f"]);
+        assert!(channel.lines().is_empty());
+    }
+
+    #[test]
+    fn push_log_prefixes_time_in_tui_mode() {
+        let channel = LogChannel::with_capacity(10);
+        let p = Progress::new(
+            "s",
+            ProgressPlan::Rounds(1),
+            ProgressOptions::default(),
+            Some(channel.clone()),
+        );
+        assert!(p.push_log("boom"));
+        let lines = channel.lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with('['), "{lines:?}");
+        assert!(lines[0].ends_with("boom]"), "{lines:?}");
+
+        // 无日志通道时返回 false,调用方走 tracing 兜底
+        let p = Progress::new(
+            "s",
+            ProgressPlan::Rounds(1),
+            ProgressOptions::default(),
+            None,
+        );
+        assert!(!p.push_log("x"));
     }
 }

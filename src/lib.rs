@@ -6,13 +6,15 @@ pub mod report;
 pub mod runner;
 pub mod scenario;
 pub mod shutdown;
+#[cfg(feature = "tui")]
+pub mod tui;
 
 pub mod error;
 
 pub mod ctxlibs;
 pub mod recorder;
 
-pub use progress::{Progress, ProgressOptions};
+pub use progress::{LogChannel, Progress, ProgressOptions};
 pub use report::{Report, ReportOptions, ScenarioReport};
 pub use runner::{RunMode, TaskIndex};
 pub use shutdown::{Shutdown, ShutdownSender};

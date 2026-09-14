@@ -2,6 +2,8 @@ use std::any::Any;
 
 use futures::future::join_all;
 
+#[cfg(feature = "tui")]
+use crate::tui::TuiOptions;
 use crate::{
     progress::{Progress, ProgressOptions, ProgressPlan},
     registry::{ScenarioRegistration, ScenarioRegistry},
@@ -20,6 +22,9 @@ pub struct ManagerConfig {
     shutdown: Option<Shutdown>,
     /// 实时进度显示选项;`None` 表示关闭(默认)
     progress: Option<ProgressOptions>,
+    /// 终端 TUI 显示选项(feature `tui`);与 `progress` 互斥
+    #[cfg(feature = "tui")]
+    tui: Option<TuiOptions>,
 }
 impl ManagerConfig {
     pub fn new(concurrency: u64) -> Self {
@@ -31,6 +36,8 @@ impl ManagerConfig {
             run_mode: None,
             shutdown: None,
             progress: None,
+            #[cfg(feature = "tui")]
+            tui: None,
         }
     }
 
@@ -67,6 +74,22 @@ impl ManagerConfig {
     /// 同 [`Self::with_progress`],但自定义刷新间隔/颜色/条宽等选项。
     pub fn with_progress_options(mut self, options: ProgressOptions) -> Self {
         self.progress = Some(options);
+        self
+    }
+
+    /// 开启终端 TUI 模式(需 feature `tui`):全屏显示顶部进度 + 日志区,
+    /// 退出后日志缓冲回放到 stderr。与 [`Self::with_progress`] 互斥。
+    /// 非 TTY(CI/重定向)时自动静默。
+    #[cfg(feature = "tui")]
+    pub fn with_tui(mut self) -> Self {
+        self.tui = Some(TuiOptions::default());
+        self
+    }
+
+    /// 同 [`Self::with_tui`],自定义日志区行数/缓冲/刷新等选项。
+    #[cfg(feature = "tui")]
+    pub fn with_tui_options(mut self, options: TuiOptions) -> Self {
+        self.tui = Some(options);
         self
     }
 }
@@ -161,15 +184,50 @@ impl ScenarioManager {
 
         let concurrency = self.config.concurrency;
 
-        // 实时进度:每场景一个句柄(计划量取自本场景解析后的 RunMode),
-        // 由 Manager 注入各并发任务;未开启时为 None,零开销。
-        let progress = self.config.progress.map(|options| {
-            let plan = match mode {
-                RunMode::Times(total) => ProgressPlan::Rounds(total),
-                RunMode::Duration(d) => ProgressPlan::Time(d),
-            };
-            Progress::new(entry.name, plan, options)
-        });
+        let plan = match mode {
+            RunMode::Times(total) => ProgressPlan::Rounds(total),
+            RunMode::Duration(d) => ProgressPlan::Time(d),
+        };
+
+        // 进度显示模式二选一:单行(progress)或 TUI(feature `tui`);
+        // 两种模式共享同一进度计数,日志通道由 TUI 持有。
+        #[cfg(feature = "tui")]
+        let tui = self
+            .config
+            .tui
+            .clone()
+            .map(|mut options| (options.clone(), options.take_channel()));
+
+        let progress = self
+            .config
+            .progress
+            .map(|options| Progress::new(entry.name, plan, options, None));
+
+        #[cfg(feature = "tui")]
+        let progress = match tui.as_ref() {
+            Some((_options, channel)) => {
+                if progress.is_some() {
+                    panic!("with_progress 与 with_tui 互斥,请只启用其一");
+                }
+                Some(Progress::new(
+                    entry.name,
+                    plan,
+                    ProgressOptions::default(),
+                    Some(channel.clone()),
+                ))
+            }
+            None => progress,
+        };
+
+        // 渲染任务:单行或 TUI;未开启时为 None,零开销
+        #[cfg(feature = "tui")]
+        let progress_guard = match tui.as_ref() {
+            Some((options, channel)) => progress
+                .as_ref()
+                .map(|p| p.start_tui(channel.clone(), options.clone(), shutdown.cloned())),
+            None => progress.as_ref().map(|p| p.start(shutdown.cloned())),
+        };
+        #[cfg(not(feature = "tui"))]
         let progress_guard = progress.as_ref().map(|p| p.start(shutdown.cloned()));
 
         let cfgs: Vec<RunnerConfig> = match mode {
@@ -204,6 +262,14 @@ impl ScenarioManager {
         // 提前返回/取消的路径由守卫 drop 兜底停止。
         if let Some(guard) = progress_guard {
             guard.stop().await;
+        }
+
+        // TUI:渲染已恢复原屏幕,把日志缓冲回放到 stderr 补全档案
+        #[cfg(feature = "tui")]
+        if let Some((_, channel)) = tui.as_ref() {
+            for line in channel.drain() {
+                eprintln!("{line}");
+            }
         }
 
         let mut it = results.into_iter();

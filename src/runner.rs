@@ -3,8 +3,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::warn;
-
 use crate::{
     error::ScenarioError,
     progress::Progress,
@@ -256,7 +254,7 @@ where
                 recorder.record_validate(validated);
             }
             Err(err) => {
-                warn!("{err:?}");
+                recorder.log_internal(format!("{err:?}"));
                 recorder.record_validate(false);
             }
         }

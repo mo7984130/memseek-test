@@ -161,7 +161,7 @@ impl Recorder {
         match result {
             Ok(_) => self.success += 1,
             Err(err) => {
-                warn!("{err:?}");
+                self.log_internal(format!("{err:?}"));
                 self.failures += 1;
                 self.error_map
                     .entry(err.kind())
@@ -185,6 +185,14 @@ impl Recorder {
         }
         if let Some(progress) = &self.progress {
             progress.validate_recorded(validate_result);
+        }
+    }
+
+    /// 框架内部日志门面:TUI 激活时进日志缓冲(不再打扰终端),
+    /// 否则照常落 tracing。
+    pub(crate) fn log_internal(&self, message: String) {
+        if !self.progress.as_ref().is_some_and(|p| p.push_log(&message)) {
+            warn!("{message}");
         }
     }
 

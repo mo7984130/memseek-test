@@ -1,6 +1,6 @@
 [package]
 name = "memseek-test"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 description = "Scenario-based async load testing framework with HTTP helpers, HDR histogram latency reports and graceful shutdown"
 license = "MIT"
@@ -21,6 +21,7 @@ serde_urlencoded = "0.7"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["signal", "rt", "time"] }
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"], optional = true }
 url = "2.5.8"
 
 [dev-dependencies]
@@ -28,3 +29,5 @@ tokio = { version = "1.53.1", features = ["net", "time", "macros"] }
 
 [features]
 default = []
+# 终端 TUI 模式:全屏显示实时进度 + 日志滚动区(需要 tracing-subscriber 接入业务日志)
+tui = ["dep:tracing-subscriber"]
