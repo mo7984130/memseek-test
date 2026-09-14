@@ -130,11 +130,23 @@ pub struct Client {
 
 impl Client {
     pub fn new(base_url: impl IntoUrl) -> Result<Self, HttpError> {
+        let mut base_url = base_url.into_url()?;
+        // 保证路径以 `/` 结尾, 使相对拼接保留 path 前缀(如 `/api`)
+        if !base_url.path().ends_with('/') {
+            let path = format!("{}/", base_url.path());
+            base_url.set_path(&path);
+        }
         Ok(Self {
-            base_url: base_url.into_url()?,
+            base_url,
             inner: reqwest::Client::new(),
             capture: CaptureOptions::default(),
         })
+    }
+
+    /// 解析请求路径: 去掉前导 `/` 做相对拼接, 保留 base 的路径前缀(如 `/api`)。
+    /// 传入完整 URL 时不受影响(前导无 `/`)。
+    fn resolve(&self, path: &str) -> Result<Url, HttpError> {
+        Ok(self.base_url.join(path.trim_start_matches('/'))?)
     }
 
     /// 链式设置请求/响应内容捕获(默认开启,截断 512 字符;`0` 关闭)。
@@ -158,7 +170,7 @@ impl Client {
     /// GET 请求:状态码非 200 时直接返回 `HttpError::Status`(压测默认行为)。
     /// 需要读取非 200 响应体时,用 [`Self::get_raw`]。
     pub async fn get(&self, url: &str) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let resp = self.inner.get(url.clone()).send().await?;
         if resp.status() != StatusCode::OK {
             return Err(
@@ -170,7 +182,7 @@ impl Client {
 
     /// GET 请求:原样返回响应(不校验状态码)。
     pub async fn get_raw(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.inner.get(self.base_url.join(url)?).send().await?;
+        let resp = self.inner.get(self.resolve(url)?).send().await?;
         Ok(resp)
     }
 
@@ -181,7 +193,7 @@ impl Client {
         url: &str,
         body: impl serde::Serialize,
     ) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let bytes = serde_json::to_vec(&body)?;
         let request_body = self.capture_body(&bytes);
         let resp = self
@@ -212,7 +224,7 @@ impl Client {
     ) -> Result<Response, HttpError> {
         let resp = self
             .inner
-            .post(self.base_url.join(url)?)
+            .post(self.resolve(url)?)
             .json(&body)
             .send()
             .await?;
@@ -225,7 +237,7 @@ impl Client {
         url: &str,
         form: &[(String, String)],
     ) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let encoded = serde_urlencoded::to_string(form)
             .map_err(|e| serde_json::Error::custom(e.to_string()))?;
         let request_body = self.capture_body(encoded.as_bytes());
@@ -260,7 +272,7 @@ impl Client {
         url: &str,
         form: reqwest::multipart::Form,
     ) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let resp = self.inner.post(url.clone()).multipart(form).send().await?;
         if resp.status() != StatusCode::OK {
             return Err(
@@ -278,7 +290,7 @@ impl Client {
     ) -> Result<Response, HttpError> {
         let resp = self
             .inner
-            .post(self.base_url.join(url)?)
+            .post(self.resolve(url)?)
             .multipart(form)
             .send()
             .await?;
@@ -288,7 +300,7 @@ impl Client {
     /// PUT 请求:状态码非 200 时返回错误。
     /// `body` 接受任意 `Serialize` 值(如 `json!({...})` 或 `&Struct`)。
     pub async fn put(&self, url: &str, body: impl serde::Serialize) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let bytes = serde_json::to_vec(&body)?;
         let request_body = self.capture_body(&bytes);
         let resp = self
@@ -319,7 +331,7 @@ impl Client {
     ) -> Result<Response, HttpError> {
         let resp = self
             .inner
-            .put(self.base_url.join(url)?)
+            .put(self.resolve(url)?)
             .json(&body)
             .send()
             .await?;
@@ -328,7 +340,7 @@ impl Client {
 
     /// DELETE 请求:状态码非 200 时返回错误。
     pub async fn delete(&self, url: &str) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let resp = self.inner.delete(url.clone()).send().await?;
         if resp.status() != StatusCode::OK {
             return Err(
@@ -340,7 +352,7 @@ impl Client {
 
     /// DELETE 请求:原样返回响应(不校验状态码)。
     pub async fn delete_raw(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.inner.delete(self.base_url.join(url)?).send().await?;
+        let resp = self.inner.delete(self.resolve(url)?).send().await?;
         Ok(resp)
     }
 
@@ -351,7 +363,7 @@ impl Client {
         url: &str,
         body: impl serde::Serialize,
     ) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let bytes = serde_json::to_vec(&body)?;
         let request_body = self.capture_body(&bytes);
         let resp = self
@@ -382,7 +394,7 @@ impl Client {
     ) -> Result<Response, HttpError> {
         let resp = self
             .inner
-            .patch(self.base_url.join(url)?)
+            .patch(self.resolve(url)?)
             .json(&body)
             .send()
             .await?;
@@ -391,7 +403,7 @@ impl Client {
 
     /// OPTIONS 请求:状态码非 200 时返回错误。
     pub async fn options(&self, url: &str) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let resp = self
             .inner
             .request(Method::OPTIONS, url.clone())
@@ -409,7 +421,7 @@ impl Client {
     pub async fn options_raw(&self, url: &str) -> Result<Response, HttpError> {
         let resp = self
             .inner
-            .request(reqwest::Method::OPTIONS, self.base_url.join(url)?)
+            .request(reqwest::Method::OPTIONS, self.resolve(url)?)
             .send()
             .await?;
         Ok(resp)
@@ -417,7 +429,7 @@ impl Client {
 
     /// HEAD 请求:状态码非 200 时返回错误。
     pub async fn head(&self, url: &str) -> Result<Response, HttpError> {
-        let url = self.base_url.join(url)?;
+        let url = self.resolve(url)?;
         let resp = self.inner.head(url.clone()).send().await?;
         if resp.status() != StatusCode::OK {
             return Err(
@@ -429,7 +441,7 @@ impl Client {
 
     /// HEAD 请求:原样返回响应(不校验状态码)。
     pub async fn head_raw(&self, url: &str) -> Result<Response, HttpError> {
-        let resp = self.inner.head(self.base_url.join(url)?).send().await?;
+        let resp = self.inner.head(self.resolve(url)?).send().await?;
         Ok(resp)
     }
 
@@ -579,7 +591,7 @@ impl<'a> RequestBuilder<'a> {
             query,
             body_snapshot: _,
         } = self;
-        let full_url = client.base_url.join(&path)?;
+        let full_url = client.resolve(&path)?;
         Self::send_impl(client, method, full_url, headers, query, body, multipart).await
     }
 
@@ -595,7 +607,7 @@ impl<'a> RequestBuilder<'a> {
             query,
             body_snapshot,
         } = self;
-        let full_url = client.base_url.join(&path)?;
+        let full_url = client.resolve(&path)?;
         let resp = Self::send_impl(
             client,
             method.clone(),
@@ -617,5 +629,47 @@ impl<'a> RequestBuilder<'a> {
             .await);
         }
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Client;
+
+    fn resolve(base: &str, path: &str) -> String {
+        Client::new(base).unwrap().resolve(path).unwrap().to_string()
+    }
+
+    #[test]
+    fn keep_base_path_prefix() {
+        // 带路径前缀的 base(如 /api): 前导 / 的请求路径应保留前缀
+        assert_eq!(
+            resolve("https://memory-seek.driftcloud.cn/api", "/auth/login"),
+            "https://memory-seek.driftcloud.cn/api/auth/login"
+        );
+    }
+
+    #[test]
+    fn no_prefix_unchanged() {
+        assert_eq!(
+            resolve("http://127.0.0.1:7985", "/auth/login"),
+            "http://127.0.0.1:7985/auth/login"
+        );
+    }
+
+    #[test]
+    fn query_preserved() {
+        assert_eq!(
+            resolve("http://localhost:8025", "/api/v2/messages?limit=100&order=desc"),
+            "http://localhost:8025/api/v2/messages?limit=100&order=desc"
+        );
+    }
+
+    #[test]
+    fn absolute_url_passthrough() {
+        assert_eq!(
+            resolve("http://127.0.0.1:7985", "https://other.example/x"),
+            "https://other.example/x"
+        );
     }
 }
