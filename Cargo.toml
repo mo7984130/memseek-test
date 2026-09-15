@@ -1,6 +1,6 @@
 [package]
 name = "memseek-test"
-version = "0.20.1"
+version = "0.20.2"
 edition = "2024"
 description = "Scenario-based async load testing framework with HTTP helpers, HDR histogram latency reports and graceful shutdown"
 license = "MIT"

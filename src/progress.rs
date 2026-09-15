@@ -363,26 +363,6 @@ fn render_line(inner: &Inner, stopping: bool, color: bool, bar_width: usize) -> 
         }
     }
 
-    let failures =
-        inner.failures.load(Ordering::Relaxed) + inner.validate_failures.load(Ordering::Relaxed);
-    if failures > 0 {
-        let _ = write!(
-            line,
-            "  {}",
-            paint(&format!("fail {failures}"), "31", color)
-        );
-    }
-
-    let failures =
-        inner.failures.load(Ordering::Relaxed) + inner.validate_failures.load(Ordering::Relaxed);
-    if failures > 0 {
-        let _ = write!(
-            line,
-            "  {}",
-            paint(&format!("fail {failures}"), "31", color)
-        );
-    }
-
     let in_flight = inner.in_flight.load(Ordering::Relaxed);
     if in_flight > 0 {
         let _ = write!(line, "  inflight {in_flight}");
@@ -459,6 +439,8 @@ mod tests {
         // 成功/失败对账:succ + err = 已完成轮数
         assert!(line.contains("succ 249"), "{line}");
         assert!(line.contains("err 1"), "{line}");
+        // fail 已由 err 取代,不得残留
+        assert!(!line.contains("fail"), "{line}");
         // 默认无颜色
         assert!(!line.contains('\x1b'), "{line}");
         // 未进入 setup、无在途请求时不显示这些片段
