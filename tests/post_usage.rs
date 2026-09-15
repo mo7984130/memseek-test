@@ -173,6 +173,24 @@ fn reqwest_error_kind_classifies_connect() {
 }
 
 #[test]
+fn http_error_reqwest_kind_is_specific() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        // 经 HttpError 封装(Client::new 路径):连接失败应细分,而非笼统 reqwest
+        let client = Client::new("http://127.0.0.1:1").unwrap();
+        let err = client
+            .request(reqwest::Method::GET, "/x")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "connect", "HttpError 应细分传输层原因");
+    });
+}
+
+#[test]
 fn reqwest_error_kind_classifies_status() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -107,7 +107,7 @@ impl HttpError {
 impl ScenarioError for HttpError {
     fn kind(&self) -> Cow<'static, str> {
         match self {
-            Self::Reqwest(_) => "reqwest".into(),
+            Self::Reqwest(err) => reqwest_error_kind(err),
             Self::Serde(_) => "serde".into(),
             Self::Url(_) => "url_parse".into(),
             Self::Status { status, .. } => format!("http_status_{}", status.as_u16()).into(),
@@ -119,6 +119,30 @@ impl ScenarioError for HttpError {
     }
 }
 
+/// reqwest 传输层错误的细分分类(与裸 `reqwest::Error` 的分类一致),
+/// 供 [`HttpError::Reqwest`] 复用,避免明细淹没在笼统的 `reqwest` 里。
+fn reqwest_error_kind(err: &reqwest::Error) -> Cow<'static, str> {
+    if let Some(status) = err.status() {
+        return format!("http_status_{}", status.as_u16()).into();
+    }
+    if err.is_timeout() {
+        return "timeout".into();
+    }
+    if err.is_connect() {
+        return "connect".into();
+    }
+    if err.is_body() || err.is_decode() {
+        return "decode".into();
+    }
+    if err.is_redirect() {
+        return "redirect".into();
+    }
+    if err.is_request() || err.is_builder() {
+        return "request".into();
+    }
+    "reqwest".into()
+}
+
 /// 直接使用 `reqwest::Client` 时,`reqwest::Error` 也能参与报告错误分类
 /// (本地 trait 可为外部类型实现,孤儿规则允许)。
 ///
@@ -126,25 +150,7 @@ impl ScenarioError for HttpError {
 /// 与 [`HttpError`] 的分类保持一致。
 impl ScenarioError for reqwest::Error {
     fn kind(&self) -> Cow<'static, str> {
-        if let Some(status) = self.status() {
-            return format!("http_status_{}", status.as_u16()).into();
-        }
-        if self.is_timeout() {
-            return "timeout".into();
-        }
-        if self.is_connect() {
-            return "connect".into();
-        }
-        if self.is_body() || self.is_decode() {
-            return "decode".into();
-        }
-        if self.is_redirect() {
-            return "redirect".into();
-        }
-        if self.is_request() || self.is_builder() {
-            return "request".into();
-        }
-        "reqwest".into()
+        reqwest_error_kind(self)
     }
 
     fn is_timeout(&self) -> bool {
