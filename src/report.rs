@@ -13,7 +13,10 @@ pub struct ScenarioReport {
     /// 该场景的执行并发度(Manager 分配的任务数)。
     pub concurrency: u64,
     pub times: u64,
+    /// 各任务耗时之和(含 setup),`merge` 累加;与墙钟 `elapsed` 不同
     pub total: Duration,
+    /// 场景墙钟耗时(Manager 从分发任务到全部结束),用于 RPS 计算
+    pub elapsed: Duration,
     pub avg: Duration,
     pub min: Duration,
     pub max: Duration,
@@ -37,12 +40,14 @@ impl ScenarioReport {
         name: impl Into<Cow<'static, str>>,
         mut recorder: Recorder,
         concurrency: u64,
+        elapsed: Duration,
     ) -> Self {
         Self {
             name: name.into(),
             concurrency,
             times: recorder.times(),
             total: recorder.total(),
+            elapsed,
             avg: recorder.avg(),
             min: recorder.min(),
             max: recorder.max(),
@@ -67,6 +72,7 @@ impl Display for ScenarioReport {
         writeln!(f, "  Times: {}", self.times)?;
         writeln!(f, "  Concurrency: {}", self.concurrency)?;
         writeln!(f, "  Total: {}", fmt_duration(self.total))?;
+        writeln!(f, "  RPS:   {}", fmt_rps(self.times, self.elapsed))?;
         writeln!(f, "  Min:  {}", fmt_duration(self.min))?;
         writeln!(f, "  Avg:  {}", fmt_duration(self.avg))?;
         writeln!(f, "  Max:  {}", fmt_duration(self.max))?;
@@ -197,6 +203,7 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
     writeln!(out, "Requests : {}", r.times).unwrap();
     writeln!(out, "Concurrent: {}", r.concurrency).unwrap();
     writeln!(out, "Total    : {}", fmt_duration(r.total)).unwrap();
+    writeln!(out, "RPS      : {}", fmt_rps(r.times, r.elapsed)).unwrap();
     writeln!(
         out,
         "Success  : {} ({:.1}%) {}",
@@ -284,6 +291,8 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     let total_validate_success: u64 = reports.iter().map(|r| r.validate_success).sum();
     let total_validate_failures: u64 = reports.iter().map(|r| r.validate_failures).sum();
     let total_total: Duration = reports.iter().map(|r| r.total).sum();
+    // 多场景由 Manager 串行执行,汇总墙钟 = 各场景 elapsed 之和
+    let total_elapsed: Duration = reports.iter().map(|r| r.elapsed).sum();
     // 有效通过:run 成功且 validate 通过,汇总与 Overall 均以此为准
     let total_passed = total_success.saturating_sub(total_validate_failures);
 
@@ -317,6 +326,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     writeln!(out, "Concurrent : {concurrency_label}").unwrap();
     writeln!(out, "Requests  : {}", total_times).unwrap();
     writeln!(out, "Total     : {}", fmt_duration(total_total)).unwrap();
+    writeln!(out, "RPS       : {}", fmt_rps(total_times, total_elapsed)).unwrap();
     writeln!(out, "Avg       : {}", fmt_duration(avg)).unwrap();
     writeln!(
         out,
@@ -483,4 +493,13 @@ pub(crate) fn bar(fraction: f64, width: usize) -> String {
 /// 可读化 Duration:一律以毫秒(ms)为单位,便于跨场景对比。
 pub(crate) fn fmt_duration(d: Duration) -> String {
     format!("{:.2}ms", d.as_nanos() as f64 / 1e6)
+}
+
+/// 每秒请求数(RPS):总请求数 / 墙钟耗时,保留两位小数。
+pub(crate) fn fmt_rps(times: u64, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return "0.00".to_string();
+    }
+    format!("{:.2}", times as f64 / secs)
 }

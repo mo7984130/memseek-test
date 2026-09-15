@@ -18,6 +18,7 @@ fn sample_report(
         concurrency,
         times,
         total: Duration::from_millis(1200),
+        elapsed: Duration::from_secs(20),
         avg: Duration::from_millis(12),
         min: Duration::from_micros(300),
         max: Duration::from_millis(95),
@@ -40,6 +41,8 @@ fn single_report_contains_core_stats() {
 
     assert!(text.contains("login"));
     assert!(text.contains("Requests : 100"));
+    // RPS = 100 / 20s = 5.00
+    assert!(text.contains("RPS      : 5.00"));
     // Success 为有效通过(run 成功且 validate 通过):98 - 2 = 96
     assert!(text.contains("96 (96.0%)"));
     assert!(text.contains("2 (2.0%)"));
@@ -81,6 +84,8 @@ fn vec_report_has_summary_and_table() {
     assert!(text.contains("Scenarios : 2"));
     assert!(text.contains("Concurrent : 16"));
     assert!(text.contains("Requests  : 1500"));
+    // 汇总 RPS = 1500 / (20s + 20s) = 37.50
+    assert!(text.contains("RPS       : 37.50"));
     // Success 为有效通过(run 成功且 validate 通过):1398 - 102 = 1296
     assert!(text.contains("Success   : 1296 (86.4%)"));
     assert!(text.contains("login"));

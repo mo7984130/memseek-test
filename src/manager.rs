@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::{any::Any, time::Instant};
 
 use futures::future::join_all;
 
@@ -228,8 +228,11 @@ impl ScenarioManager {
                 .collect(),
         };
 
+        // 墙钟耗时:整个场景从分发到全部任务结束,用于报告 RPS
+        let start = Instant::now();
         let futures: Vec<_> = cfgs.iter().map(|c| (entry.invoke)(ctx, c)).collect();
         let results = join_all(futures).await;
+        let elapsed = start.elapsed();
 
         // 所有轮次结束后停止渲染,等渲染任务收尾(恢复屏幕),
         // 再交给调用方打印报告;提前返回/取消的路径由守卫 drop 兜底。
@@ -262,6 +265,6 @@ impl ScenarioManager {
         for other in it {
             merged.merge(other);
         }
-        ScenarioReport::from_recorder(entry.name, merged, self.config.concurrency)
+        ScenarioReport::from_recorder(entry.name, merged, self.config.concurrency, elapsed)
     }
 }
