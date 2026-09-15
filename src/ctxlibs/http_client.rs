@@ -6,6 +6,7 @@ use crate::error::ScenarioError;
 use reqwest::{IntoUrl, Method, Response, StatusCode, Url};
 use serde::ser::Error as _;
 
+pub use reqwest;
 /// 重新导出 reqwest 的 multipart 类型(`Form` / `Part`),
 /// 便于构造 multipart/form-data 表单,且与 crate 内部 reqwest 版本一致。
 pub use reqwest::multipart;
