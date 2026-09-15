@@ -139,6 +139,8 @@ struct Inner {
     /// run 成功次数(与报告 `success` 对齐)
     success: AtomicU64,
     failures: AtomicU64,
+    /// 超时类软失败次数(与报告 `timeouts` 对齐,由 `timeout_recorded` 累加)
+    timeouts: AtomicU64,
     validate_failures: AtomicU64,
     /// 当前在途请求数(`begin_round` / `end_round` 维护)
     in_flight: AtomicU64,
@@ -168,6 +170,7 @@ impl Progress {
                 rounds: AtomicU64::new(0),
                 success: AtomicU64::new(0),
                 failures: AtomicU64::new(0),
+                timeouts: AtomicU64::new(0),
                 validate_failures: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 in_setup: AtomicU64::new(0),
@@ -261,6 +264,11 @@ impl Progress {
         }
     }
 
+    /// 记录一轮超时软失败(不计入 failures)
+    pub(crate) fn timeout_recorded(&self) {
+        self.inner.timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// 记录一轮 validate 结果
     pub(crate) fn validate_recorded(&self, ok: bool) {
         if !ok {
@@ -349,7 +357,7 @@ fn render_line(inner: &Inner, stopping: bool, color: bool, bar_width: usize) -> 
     );
 
     // 成功/失败对账:succ = 有效通过(run 成功且 validate 通过),
-    // err = run 失败 + validate 失败;两者之和 = 已完成轮数
+    // err = run 失败 + validate 失败;超时软失败单独以黄色显示
     if rounds > 0 {
         let passed = inner
             .success
@@ -357,9 +365,17 @@ fn render_line(inner: &Inner, stopping: bool, color: bool, bar_width: usize) -> 
             .saturating_sub(inner.validate_failures.load(Ordering::Relaxed));
         let err = inner.failures.load(Ordering::Relaxed)
             + inner.validate_failures.load(Ordering::Relaxed);
+        let timeouts = inner.timeouts.load(Ordering::Relaxed);
         let _ = write!(line, "  succ {passed}");
         if err > 0 {
             let _ = write!(line, "  {}", paint(&format!("err {err}"), "31", color));
+        }
+        if timeouts > 0 {
+            let _ = write!(
+                line,
+                "  {}",
+                paint(&format!("timeout {timeouts}"), "33", color)
+            );
         }
     }
 
@@ -429,6 +445,9 @@ mod tests {
         for _ in 0..249 {
             p.validate_recorded(true);
         }
+        for _ in 0..3 {
+            p.timeout_recorded();
+        }
 
         let line = render_line(&p.inner, false, false, 20);
         assert!(line.contains("login"), "{line}");
@@ -439,6 +458,8 @@ mod tests {
         // 成功/失败对账:succ + err = 已完成轮数
         assert!(line.contains("succ 249"), "{line}");
         assert!(line.contains("err 1"), "{line}");
+        // 超时软失败单独计数,黄字着色由 color_option 覆盖
+        assert!(line.contains("timeout 3"), "{line}");
         // fail 已由 err 取代,不得残留
         assert!(!line.contains("fail"), "{line}");
         // 默认无颜色

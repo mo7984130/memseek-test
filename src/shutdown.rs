@@ -4,6 +4,8 @@
 //! [`ShutdownSender`] 触发停止,可克隆的 [`Shutdown`] 由各并发任务周期性
 //! 检查(`is_cancelled`),实现"当前轮次完成后停止,不再启动新轮次"的语义。
 
+use std::time::Duration;
+
 use tokio::sync::watch;
 
 /// 优雅关闭信号(检查端,可克隆)。
@@ -36,6 +38,18 @@ impl Shutdown {
     /// 是否已收到停止信号。
     pub fn is_cancelled(&self) -> bool {
         *self.rx.borrow()
+    }
+
+    /// Future:等待停止信号;已触发则立即完成。
+    ///
+    /// 用于退避等待等可中断路径:`tokio::select!` 中与休眠竞争,
+    /// 信号到达时立即返回,不阻塞优雅关闭。
+    /// 内部以 10ms 粒度轮询(`watch::Receiver::changed` 需可变借用,
+    /// 与共享 `Shutdown` 语义冲突),对关闭信号的响应延迟可忽略。
+    pub async fn wait_cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// 便捷绑定:在 Tokio runtime 中监听 OS 的 Ctrl-C(SIGINT),

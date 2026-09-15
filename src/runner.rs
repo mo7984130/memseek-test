@@ -19,6 +19,40 @@ pub enum RunMode {
     Duration(Duration),
 }
 
+/// 超时退避配置:请求超时后等待 `initial` 起,按 `factor` 指数增长,封顶 `max`;
+/// 任意非超时结果(成功或普通失败)复位到 `initial`。
+///
+/// 目的:被测系统过载时自动减速,避免超时风暴雪上加霜;恢复后自动回到满速。
+#[derive(Clone, Copy, Debug)]
+pub struct BackoffConfig {
+    /// 首次退避等待(默认 100ms)
+    pub initial: Duration,
+    /// 退避最大值(默认 5s)
+    pub max: Duration,
+    /// 增长倍数(默认 2.0)
+    pub factor: f64,
+}
+
+impl Default for BackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_millis(100),
+            max: Duration::from_secs(5),
+            factor: 2.0,
+        }
+    }
+}
+
+impl BackoffConfig {
+    pub const fn new(initial: Duration, max: Duration, factor: f64) -> Self {
+        Self {
+            initial,
+            max,
+            factor,
+        }
+    }
+}
+
 /// 并发任务身份,由 Manager 分片时分配,使用者只读。
 ///
 /// `index` 为该任务编号(范围 `0..total`);每个并发任务拥有唯一的
@@ -54,6 +88,8 @@ pub struct RunnerConfig {
     pub task_total: usize,
     /// 优雅关闭信号;触发后当前轮次完成即停止(不再启动新轮次)
     pub shutdown: Option<Shutdown>,
+    /// 超时退避;`None` 表示超时后立即进入下一轮(默认)
+    pub backoff: Option<BackoffConfig>,
     /// 实时进度上报句柄(feature `tui`,由 Manager 注入);`None` 表示不上报
     #[cfg(feature = "tui")]
     pub progress: Option<Progress>,
@@ -77,17 +113,20 @@ where
     }
 
     /// 执行并记录一轮 `run`,成功时进入 `validate`。
+    /// 返回该轮是否超时(用于触发退避)。
     async fn run_and_validate(
         ctx: &S::Ctx,
         task: &TaskIndex,
         setup: &S::Setup,
         recorder: &mut Recorder,
-    ) {
+    ) -> bool {
         let result = Self::once(ctx, task, setup, recorder).await;
+        let timed_out = result.as_ref().is_err_and(|e| e.is_timeout());
         // run 失败已记录,不再进入 validate
         if let Ok(output) = &result {
             Self::validate(ctx, task, setup, output, recorder).await;
         }
+        timed_out
     }
 
     pub async fn run(&self, ctx: &S::Ctx) -> Recorder {
@@ -122,6 +161,7 @@ where
                 }
                 match self.config.mode {
                     RunMode::Times(times) => {
+                        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
                         for round in 0..times {
                             if self.is_cancelled() {
                                 recorder.record_interrupted();
@@ -132,12 +172,26 @@ where
                                 self.config.task_total,
                                 round as usize,
                             );
-                            Self::run_and_validate(ctx, &task, &setup, &mut recorder).await;
+                            if Self::run_round(
+                                ctx,
+                                &task,
+                                &setup,
+                                &mut recorder,
+                                self.config.shutdown.as_ref(),
+                                self.config.backoff,
+                                &mut backoff_wait,
+                            )
+                            .await
+                            {
+                                recorder.record_interrupted();
+                                break;
+                            }
                         }
                     }
                     RunMode::Duration(duration) => {
                         let mut remaining = duration;
                         let mut round = 0usize;
+                        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
 
                         while !remaining.is_zero() {
                             if self.is_cancelled() {
@@ -152,7 +206,20 @@ where
                             );
                             round += 1;
 
-                            Self::run_and_validate(ctx, &task, &setup, &mut recorder).await;
+                            if Self::run_round(
+                                ctx,
+                                &task,
+                                &setup,
+                                &mut recorder,
+                                self.config.shutdown.as_ref(),
+                                self.config.backoff,
+                                &mut backoff_wait,
+                            )
+                            .await
+                            {
+                                recorder.record_interrupted();
+                                break;
+                            }
 
                             remaining = remaining.saturating_sub(start.elapsed());
                         }
@@ -163,6 +230,7 @@ where
                 // setup 每轮一次:失败则记一次失败并中止任务
                 match self.config.mode {
                     RunMode::Times(times) => {
+                        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
                         for round in 0..times {
                             if self.is_cancelled() {
                                 recorder.record_interrupted();
@@ -180,12 +248,26 @@ where
                                     return recorder;
                                 }
                             };
-                            Self::run_and_validate(ctx, &task, &setup, &mut recorder).await;
+                            if Self::run_round(
+                                ctx,
+                                &task,
+                                &setup,
+                                &mut recorder,
+                                self.config.shutdown.as_ref(),
+                                self.config.backoff,
+                                &mut backoff_wait,
+                            )
+                            .await
+                            {
+                                recorder.record_interrupted();
+                                break;
+                            }
                         }
                     }
                     RunMode::Duration(duration) => {
                         let mut remaining = duration;
                         let mut round = 0usize;
+                        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
 
                         while !remaining.is_zero() {
                             if self.is_cancelled() {
@@ -207,7 +289,20 @@ where
                                 }
                             };
 
-                            Self::run_and_validate(ctx, &task, &setup, &mut recorder).await;
+                            if Self::run_round(
+                                ctx,
+                                &task,
+                                &setup,
+                                &mut recorder,
+                                self.config.shutdown.as_ref(),
+                                self.config.backoff,
+                                &mut backoff_wait,
+                            )
+                            .await
+                            {
+                                recorder.record_interrupted();
+                                break;
+                            }
 
                             remaining = remaining.saturating_sub(start.elapsed());
                         }
@@ -217,6 +312,55 @@ where
         }
 
         recorder
+    }
+
+    /// 退避初始值:未配置退避时用零占位(不产生等待)。
+    fn backoff_initial(backoff: Option<BackoffConfig>) -> Duration {
+        backoff.map(|b| b.initial).unwrap_or(Duration::ZERO)
+    }
+
+    /// 执行一轮并处理退避:本轮超时则等待退避时间(可被停止信号打断),
+    /// 返回 `true` 表示因停止信号提前退出。
+    /// 非超时结果(成功或普通失败)将退避复位。
+    async fn run_round(
+        ctx: &S::Ctx,
+        task: &TaskIndex,
+        setup: &S::Setup,
+        recorder: &mut Recorder,
+        shutdown: Option<&Shutdown>,
+        backoff: Option<BackoffConfig>,
+        wait: &mut Duration,
+    ) -> bool {
+        let timed_out = Self::run_and_validate(ctx, task, setup, recorder).await;
+        let Some(cfg) = backoff else {
+            return false;
+        };
+        if timed_out {
+            if Self::wait_or_cancel(shutdown, *wait).await {
+                return true;
+            }
+            // 指数增长,封顶 max,不低于 initial
+            let next = wait.as_secs_f64() * cfg.factor;
+            *wait = Duration::from_secs_f64(next.min(cfg.max.as_secs_f64()));
+            *wait = (*wait).max(cfg.initial);
+        } else if *wait != cfg.initial {
+            *wait = cfg.initial;
+        }
+        false
+    }
+
+    /// 退避等待;绑定停止信号时,信号到达立即返回 `true`。
+    async fn wait_or_cancel(shutdown: Option<&Shutdown>, duration: Duration) -> bool {
+        match shutdown {
+            Some(s) => tokio::select! {
+                _ = tokio::time::sleep(duration) => false,
+                _ = s.wait_cancelled() => true,
+            },
+            None => {
+                tokio::time::sleep(duration).await;
+                false
+            }
+        }
     }
 
     /// 是否已收到优雅关闭信号。

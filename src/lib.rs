@@ -18,7 +18,7 @@ pub mod recorder;
 #[cfg(feature = "tui")]
 pub use progress::{LogChannel, Progress};
 pub use report::{Report, ReportOptions, ScenarioReport};
-pub use runner::{RunMode, TaskIndex};
+pub use runner::{BackoffConfig, RunMode, TaskIndex};
 pub use shutdown::{Shutdown, ShutdownSender};
 
 // 让 #[macro_export] 宏展开时能写 $crate::inventory::submit!,

@@ -29,6 +29,7 @@ fn sample_report(
         validate_failures: failures,
         success,
         failures,
+        timeouts: 0,
         error_map,
         interrupted: false,
     }
@@ -46,6 +47,7 @@ fn single_report_contains_core_stats() {
     // Success 为有效通过(run 成功且 validate 通过):98 - 2 = 96
     assert!(text.contains("96 (96.0%)"));
     assert!(text.contains("2 (2.0%)"));
+    assert!(text.contains("Timeout  : 0 (0.0%)"));
     assert!(text.contains("Latency"));
     assert!(text.contains("P95"));
     assert!(text.contains("timeout"));

@@ -113,6 +113,10 @@ impl ScenarioError for HttpError {
             Self::Status { status, .. } => format!("http_status_{}", status.as_u16()).into(),
         }
     }
+
+    fn is_timeout(&self) -> bool {
+        matches!(self, Self::Reqwest(e) if e.is_timeout())
+    }
 }
 
 /// 直接使用 `reqwest::Client` 时,`reqwest::Error` 也能参与报告错误分类
@@ -141,6 +145,10 @@ impl ScenarioError for reqwest::Error {
             return "request".into();
         }
         "reqwest".into()
+    }
+
+    fn is_timeout(&self) -> bool {
+        self.is_timeout()
     }
 }
 

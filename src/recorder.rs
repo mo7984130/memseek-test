@@ -18,6 +18,8 @@ pub struct Recorder {
 
     pub success: u64,
     pub failures: u64,
+    /// 超时类软失败数(不加剧 `failures`;由 [`ScenarioError::is_timeout`] 判定)
+    pub timeouts: u64,
     pub error_map: HashMap<Cow<'static, str>, u64>,
 
     pub validate_success: u64,
@@ -41,6 +43,7 @@ impl Recorder {
             progress: None,
             success: 0,
             failures: 0,
+            timeouts: 0,
             error_map: HashMap::new(),
             validate_success: 0,
             validate_failures: 0,
@@ -109,6 +112,7 @@ impl Recorder {
         self.total += other.total;
         self.success += other.success;
         self.failures += other.failures;
+        self.timeouts += other.timeouts;
         for (kind, count) in other.error_map {
             *self.error_map.entry(kind).or_insert(0) += count;
         }
@@ -175,7 +179,20 @@ impl Recorder {
             Ok(_) => self.success += 1,
             Err(err) => {
                 self.log_internal(format!("{err:?}"));
-                self.failures += 1;
+                if err.is_timeout() {
+                    // 超时:被测系统过载信号,不计入失败
+                    self.timeouts += 1;
+                    #[cfg(feature = "tui")]
+                    if let Some(progress) = &self.progress {
+                        progress.timeout_recorded();
+                    }
+                } else {
+                    self.failures += 1;
+                    #[cfg(feature = "tui")]
+                    if let Some(progress) = &self.progress {
+                        progress.result_recorded(false);
+                    }
+                }
                 self.error_map
                     .entry(err.kind())
                     .and_modify(|count| *count += 1)

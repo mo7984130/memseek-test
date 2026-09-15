@@ -9,7 +9,7 @@ use crate::tui::TuiOptions;
 use crate::{
     registry::{ScenarioRegistration, ScenarioRegistry},
     report::ScenarioReport,
-    runner::{RunMode, RunnerConfig},
+    runner::{BackoffConfig, RunMode, RunnerConfig},
     shutdown::Shutdown,
 };
 
@@ -19,6 +19,8 @@ pub struct ManagerConfig {
     concurrency: u64,
     /// 运行模式, 存在的情况下会覆盖scenario配置
     run_mode: Option<RunMode>,
+    /// 超时退避;`None` 表示超时后立即进入下一轮(默认)
+    backoff: Option<BackoffConfig>,
     /// 全局优雅关闭信号;也可在调用时用 `run*_with_shutdown` 显式传入
     shutdown: Option<Shutdown>,
     /// 终端 TUI 显示选项(feature `tui`);`None` 表示关闭(默认)
@@ -33,6 +35,7 @@ impl ManagerConfig {
         Self {
             concurrency,
             run_mode: None,
+            backoff: None,
             shutdown: None,
             #[cfg(feature = "tui")]
             tui: None,
@@ -41,6 +44,14 @@ impl ManagerConfig {
 
     pub fn with_run_mode(mut self, run_mode: RunMode) -> Self {
         self.run_mode = Some(run_mode);
+        self
+    }
+
+    /// 启用超时退避:请求超时(过载信号)后等待退避时间再发下一轮,
+    /// 指数增长封顶 `max`,请求恢复成功后复位。
+    /// 未启用时超时后立即进入下一轮。
+    pub fn with_backoff(mut self, backoff: BackoffConfig) -> Self {
+        self.backoff = Some(backoff);
         self
     }
 
@@ -211,6 +222,7 @@ impl ScenarioManager {
             task_index: i as usize,
             task_total: concurrency as usize,
             shutdown: shutdown.cloned(),
+            backoff: self.config.backoff,
             #[cfg(feature = "tui")]
             progress: progress.clone(),
         };

@@ -29,6 +29,8 @@ pub struct ScenarioReport {
 
     pub success: u64,
     pub failures: u64,
+    /// 超时类软失败数(单独统计,不加剧失败率)
+    pub timeouts: u64,
     pub error_map: HashMap<Cow<'static, str>, u64>,
 
     /// 该场景是否因优雅关闭(停止信号)提前结束
@@ -60,6 +62,7 @@ impl ScenarioReport {
 
             success: recorder.success,
             failures: recorder.failures,
+            timeouts: recorder.timeouts,
             error_map: recorder.error_map,
             interrupted: recorder.interrupted,
         }
@@ -85,6 +88,7 @@ impl Display for ScenarioReport {
 
         writeln!(f, "  Success: {}", self.success)?;
         writeln!(f, "  Failures: {}", self.failures)?;
+        writeln!(f, "  Timeouts: {}", self.timeouts)?;
         if self.interrupted {
             writeln!(f, "  Interrupted: true (graceful shutdown)")?;
         }
@@ -215,6 +219,13 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
     writeln!(out, "Failures : {} ({:.1}%)", r.failures, fail_rate * 100.0,).unwrap();
     writeln!(
         out,
+        "Timeout  : {} ({:.1}%)",
+        r.timeouts,
+        rate_of(r.timeouts, r.times) * 100.0,
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Validate : {} ok / {} fail",
         r.validate_success, r.validate_failures,
     )
@@ -256,10 +267,10 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
         writeln!(out).unwrap();
         writeln!(out, "Errors:").unwrap();
 
-        // 明细包含 run 失败与 validate 失败;分母为全部失败轮,保证占比对账
+        // 明细包含 run 失败、超时与 validate 失败;分母为全部非成功轮,保证占比对账
         let mut errs: Vec<_> = r.error_map.iter().collect();
         errs.sort_by(|a, b| b.1.cmp(a.1));
-        let denom = (r.failures + r.validate_failures).max(1) as f64;
+        let denom = (r.failures + r.timeouts + r.validate_failures).max(1) as f64;
         for (kind, count) in errs {
             let frac = *count as f64 / denom;
             writeln!(
@@ -288,6 +299,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     let total_times: u64 = reports.iter().map(|r| r.times).sum();
     let total_success: u64 = reports.iter().map(|r| r.success).sum();
     let total_failures: u64 = reports.iter().map(|r| r.failures).sum();
+    let total_timeouts: u64 = reports.iter().map(|r| r.timeouts).sum();
     let total_validate_success: u64 = reports.iter().map(|r| r.validate_success).sum();
     let total_validate_failures: u64 = reports.iter().map(|r| r.validate_failures).sum();
     let total_total: Duration = reports.iter().map(|r| r.total).sum();
@@ -337,6 +349,13 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     )
     .unwrap();
     writeln!(out, "Failures  : {}", total_failures).unwrap();
+    writeln!(
+        out,
+        "Timeout   : {} ({:.1}%)",
+        total_timeouts,
+        rate_of(total_timeouts, total_times) * 100.0,
+    )
+    .unwrap();
     writeln!(
         out,
         "Validate  : {} ok / {} fail",
@@ -420,10 +439,10 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         for r in err_rows {
             writeln!(out, "{}", paint(&format!("  {}.", r.name), "1", o.color)).unwrap();
 
-            // 明细包含 run 失败与 validate 失败;分母为全部失败轮,保证占比对账
+            // 明细包含 run 失败、超时与 validate 失败;分母为全部非成功轮,保证占比对账
             let mut errs: Vec<_> = r.error_map.iter().collect();
             errs.sort_by(|a, b| b.1.cmp(a.1));
-            let denom = (r.failures + r.validate_failures).max(1) as f64;
+            let denom = (r.failures + r.timeouts + r.validate_failures).max(1) as f64;
             for (kind, count) in errs {
                 let frac = *count as f64 / denom;
                 writeln!(
