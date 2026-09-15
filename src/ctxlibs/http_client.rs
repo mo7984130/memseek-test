@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::ops::Deref;
+use std::time::Duration;
 
 use crate::error::ScenarioError;
 use reqwest::{IntoUrl, Method, Response, StatusCode, Url};
@@ -195,11 +196,21 @@ fn normalize_base(mut base_url: Url) -> Url {
     base_url
 }
 
+/// 默认请求超时(30s)。
+///
+/// reqwest 默认**不设超时**,服务端挂起时请求会无限期等待,拖死整个压测进程。
+/// `Client::new` 会应用该兕底值;需要自定义超时(上传大文件等)时用
+/// [`Client::from_reqwest`] 自行构建。
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Client {
-    /// 使用 reqwest 默认配置(等价于 `reqwest::Client::new()`);
-    /// 需要自定义超时/连接池/TLS 时用 [`Self::from_reqwest`]。
+    /// 使用默认配置:统一 `base_url` 相对路径解析 + 30s 请求超时
+    /// (见 [`DEFAULT_TIMEOUT`]);需要自定义超时/连接池/TLS 时用 [`Self::from_reqwest`]。
     pub fn new(base_url: impl IntoUrl) -> Result<Self, HttpError> {
-        Self::from_reqwest(reqwest::Client::new(), base_url)
+        let inner = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()?;
+        Self::from_reqwest(inner, base_url)
     }
 
     /// 用自定义的 `reqwest::Client` 构造, 底层能力(超时、连接池、
