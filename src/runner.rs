@@ -100,6 +100,16 @@ pub struct ScenarioRunner<S> {
     _marker: PhantomData<S>,
 }
 
+/// setup 执行结果。
+enum SetupDone<S> {
+    /// setup 成功(已复位退避)
+    Ready(S),
+    /// 普通失败(已记录),任务应中止
+    Failed,
+    /// 超时退避等待中被停止信号打断,任务应中止
+    Cancelled,
+}
+
 impl<S> ScenarioRunner<S>
 where
     S: Scenario,
@@ -144,16 +154,27 @@ where
                 let setup_task = TaskIndex::new(self.config.task_index, self.config.task_total, 0);
                 #[cfg(feature = "tui")]
                 recorder.begin_setup();
-                let setup = S::setup(ctx, &setup_task).await;
-                #[cfg(feature = "tui")]
-                recorder.end_setup();
-                let setup = match setup {
-                    Ok(setup) => setup,
-                    Err(err) => {
-                        recorder.record_result(&Err::<(), S::Error>(err));
+                // 退避状态在 setup 与 run 轮次间共享:任意成功(系统恢复)后复位
+                let mut backoff_wait = Self::backoff_initial(self.config.backoff);
+                let setup = match Self::setup_retrying(
+                    ctx,
+                    &setup_task,
+                    &mut recorder,
+                    self.config.shutdown.as_ref(),
+                    self.config.backoff,
+                    &mut backoff_wait,
+                )
+                .await
+                {
+                    SetupDone::Ready(setup) => setup,
+                    SetupDone::Failed => return recorder,
+                    SetupDone::Cancelled => {
+                        recorder.record_interrupted();
                         return recorder;
                     }
                 };
+                #[cfg(feature = "tui")]
+                recorder.end_setup();
                 // setup 期间收到信号:等 setup 完成后直接退出,不进入 run 循环
                 if self.is_cancelled() {
                     recorder.record_interrupted();
@@ -161,7 +182,6 @@ where
                 }
                 match self.config.mode {
                     RunMode::Times(times) => {
-                        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
                         for round in 0..times {
                             if self.is_cancelled() {
                                 recorder.record_interrupted();
@@ -191,7 +211,6 @@ where
                     RunMode::Duration(duration) => {
                         let mut remaining = duration;
                         let mut round = 0usize;
-                        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
 
                         while !remaining.is_zero() {
                             if self.is_cancelled() {
@@ -227,7 +246,7 @@ where
                 }
             }
             SetupMode::Round => {
-                // setup 每轮一次:失败则记一次失败并中止任务
+                // setup 每轮一次:普通失败中止任务,超时退避重试
                 match self.config.mode {
                     RunMode::Times(times) => {
                         let mut backoff_wait = Self::backoff_initial(self.config.backoff);
@@ -241,11 +260,21 @@ where
                                 self.config.task_total,
                                 round as usize,
                             );
-                            let setup = match S::setup(ctx, &task).await {
-                                Ok(setup) => setup,
-                                Err(err) => {
-                                    recorder.record_result(&Err::<(), S::Error>(err));
-                                    return recorder;
+                            let setup = match Self::setup_retrying(
+                                ctx,
+                                &task,
+                                &mut recorder,
+                                self.config.shutdown.as_ref(),
+                                self.config.backoff,
+                                &mut backoff_wait,
+                            )
+                            .await
+                            {
+                                SetupDone::Ready(setup) => setup,
+                                SetupDone::Failed => return recorder,
+                                SetupDone::Cancelled => {
+                                    recorder.record_interrupted();
+                                    break;
                                 }
                             };
                             if Self::run_round(
@@ -281,11 +310,21 @@ where
                                 round,
                             );
                             round += 1;
-                            let setup = match S::setup(ctx, &task).await {
-                                Ok(setup) => setup,
-                                Err(err) => {
-                                    recorder.record_result(&Err::<(), S::Error>(err));
-                                    return recorder;
+                            let setup = match Self::setup_retrying(
+                                ctx,
+                                &task,
+                                &mut recorder,
+                                self.config.shutdown.as_ref(),
+                                self.config.backoff,
+                                &mut backoff_wait,
+                            )
+                            .await
+                            {
+                                SetupDone::Ready(setup) => setup,
+                                SetupDone::Failed => return recorder,
+                                SetupDone::Cancelled => {
+                                    recorder.record_interrupted();
+                                    break;
                                 }
                             };
 
@@ -317,6 +356,52 @@ where
     /// 退避初始值:未配置退避时用零占位(不产生等待)。
     fn backoff_initial(backoff: Option<BackoffConfig>) -> Duration {
         backoff.map(|b| b.initial).unwrap_or(Duration::ZERO)
+    }
+
+    /// 执行 setup,失败时处理同 `run_round` 的退避语义:
+    /// 超时 → 退避后重试(可被停止信号打断);普通失败或未配置退避时中止。
+    async fn setup_retrying(
+        ctx: &S::Ctx,
+        task: &TaskIndex,
+        recorder: &mut Recorder,
+        shutdown: Option<&Shutdown>,
+        backoff: Option<BackoffConfig>,
+        wait: &mut Duration,
+    ) -> SetupDone<S::Setup> {
+        let Some(cfg) = backoff else {
+            // 未配置退避:保持旧语义,失败即中止
+            return match S::setup(ctx, task).await {
+                Ok(setup) => SetupDone::Ready(setup),
+                Err(err) => {
+                    recorder.record_result(&Err::<(), S::Error>(err));
+                    SetupDone::Failed
+                }
+            };
+        };
+        loop {
+            match S::setup(ctx, task).await {
+                Ok(setup) => {
+                    if *wait != cfg.initial {
+                        *wait = cfg.initial;
+                    }
+                    return SetupDone::Ready(setup);
+                }
+                Err(err) => {
+                    let timed_out = err.is_timeout();
+                    recorder.record_result(&Err::<(), S::Error>(err));
+                    if !timed_out {
+                        return SetupDone::Failed;
+                    }
+                    if Self::wait_or_cancel(shutdown, *wait).await {
+                        return SetupDone::Cancelled;
+                    }
+                    // 指数增长,封顶 max,不低于 initial
+                    let next = wait.as_secs_f64() * cfg.factor;
+                    *wait = Duration::from_secs_f64(next.min(cfg.max.as_secs_f64()));
+                    *wait = (*wait).max(cfg.initial);
+                }
+            }
+        }
     }
 
     /// 执行一轮并处理退避:本轮超时则等待退避时间(可被停止信号打断),

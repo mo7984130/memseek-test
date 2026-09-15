@@ -102,6 +102,81 @@ impl Scenario for FlakyFirstNoBackoff {
     }
 }
 
+/// setup 首次超时、之后成功:验证 setup 纳入退避重试。
+#[derive(Default)]
+struct SetupFlaky;
+
+static SETUP_FLAKY_CALLS: AtomicU64 = AtomicU64::new(0);
+
+impl Scenario for SetupFlaky {
+    type Ctx = ();
+    type Error = TestErr;
+    type Output = ();
+    type Setup = ();
+
+    async fn setup(_ctx: &Self::Ctx, _task: &TaskIndex) -> Result<Self::Setup, Self::Error> {
+        if SETUP_FLAKY_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(TestErr::Timeout)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn run(
+        _ctx: &Self::Ctx,
+        _task: &TaskIndex,
+        _setup: &Self::Setup,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(())
+    }
+}
+
+/// setup 普通失败:应中止任务(不重试)。
+#[derive(Default)]
+struct SetupHardFail;
+
+impl Scenario for SetupHardFail {
+    type Ctx = ();
+    type Error = TestErr;
+    type Output = ();
+    type Setup = ();
+
+    async fn setup(_ctx: &Self::Ctx, _task: &TaskIndex) -> Result<Self::Setup, Self::Error> {
+        Err(TestErr::Boom)
+    }
+
+    async fn run(
+        _ctx: &Self::Ctx,
+        _task: &TaskIndex,
+        _setup: &Self::Setup,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(())
+    }
+}
+
+/// setup 超时但未配置退避:保持旧语义,中止任务。
+#[derive(Default)]
+struct SetupTimeoutNoBackoff;
+
+impl Scenario for SetupTimeoutNoBackoff {
+    type Ctx = ();
+    type Error = TestErr;
+    type Output = ();
+    type Setup = ();
+
+    async fn setup(_ctx: &Self::Ctx, _task: &TaskIndex) -> Result<Self::Setup, Self::Error> {
+        Err(TestErr::Timeout)
+    }
+
+    async fn run(
+        _ctx: &Self::Ctx,
+        _task: &TaskIndex,
+        _setup: &Self::Setup,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(())
+    }
+}
+
 fn runner_config(
     mode: RunMode,
     shutdown: Option<Shutdown>,
@@ -170,6 +245,59 @@ fn backoff_wait_is_interrupted_by_shutdown() {
     assert!(recorder.interrupted, "退避期间应能响应停止信号");
     assert_eq!(recorder.failures, 0);
     assert!(recorder.timeouts >= 1, "至少发生一轮超时");
+}
+
+#[test]
+fn setup_timeout_backs_off_then_retries() {
+    SETUP_FLAKY_CALLS.store(0, Ordering::SeqCst);
+    let recorder = rt().block_on(async {
+        let runner = ScenarioRunner::<SetupFlaky>::new(runner_config(
+            RunMode::Times(2),
+            None,
+            Some(BackoffConfig::new(
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+                2.0,
+            )),
+        ));
+        runner.run(&()).await
+    });
+
+    assert_eq!(recorder.success, 2, "setup 重试成功后应跑满轮次");
+    assert_eq!(recorder.failures, 0);
+    assert_eq!(recorder.timeouts, 1, "setup 超时计入 timeouts");
+}
+
+#[test]
+fn setup_plain_failure_aborts_task() {
+    let recorder = rt().block_on(async {
+        let runner = ScenarioRunner::<SetupHardFail>::new(runner_config(
+            RunMode::Times(2),
+            None,
+            Some(BackoffConfig::default()),
+        ));
+        runner.run(&()).await
+    });
+
+    assert_eq!(recorder.success, 0, "setup 失败不应进入 run");
+    assert_eq!(recorder.failures, 1, "普通失败计为失败且不重试");
+    assert_eq!(recorder.timeouts, 0);
+}
+
+#[test]
+fn setup_timeout_without_backoff_aborts_task() {
+    let recorder = rt().block_on(async {
+        let runner = ScenarioRunner::<SetupTimeoutNoBackoff>::new(runner_config(
+            RunMode::Times(2),
+            None,
+            None, // 未配置退避:保持旧语义
+        ));
+        runner.run(&()).await
+    });
+
+    assert_eq!(recorder.success, 0);
+    assert_eq!(recorder.failures, 0);
+    assert_eq!(recorder.timeouts, 1);
 }
 
 #[test]

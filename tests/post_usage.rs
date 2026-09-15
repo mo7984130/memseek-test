@@ -162,13 +162,13 @@ fn reqwest_error_kind_classifies_connect() {
         .build()
         .unwrap();
     rt.block_on(async {
-        // 无法连接(127.0.0.1:1 拒绝连接): 裸 reqwest::Error 也能分类
+        // 无法连接(127.0.0.1:1 拒绝连接): 细分到 connect_refused
         let err = reqwest::Client::new()
             .get("http://127.0.0.1:1/x")
             .send()
             .await
             .unwrap_err();
-        assert_eq!(err.kind(), "connect");
+        assert_eq!(err.kind(), "connect_refused");
     });
 }
 
@@ -186,7 +186,7 @@ fn http_error_reqwest_kind_is_specific() {
             .send()
             .await
             .unwrap_err();
-        assert_eq!(err.kind(), "connect", "HttpError 应细分传输层原因");
+        assert_eq!(err.kind(), "connect_refused", "HttpError 应细分传输层原因");
     });
 }
 

@@ -201,8 +201,11 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
 
     // Success 指有效通过(含 validate):run 成功但断言失败的轮次另见 Validate 行
     let passed = passed_rounds(r.success, r.validate_failures);
-    let success_rate = rate_of(passed, r.times);
-    let fail_rate = rate_of(r.failures, r.times);
+    // 百分比分母 = 已产生结果的轮次(含超时软失败),保证各行占比可对账
+    let denom = r.times + r.timeouts;
+    let success_rate = rate_of(passed, denom);
+    let fail_rate = rate_of(r.failures, denom);
+    let timeout_rate = rate_of(r.timeouts, denom);
 
     writeln!(out, "Requests : {}", r.times).unwrap();
     writeln!(out, "Concurrent: {}", r.concurrency).unwrap();
@@ -221,7 +224,7 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
         out,
         "Timeout  : {} ({:.1}%)",
         r.timeouts,
-        rate_of(r.timeouts, r.times) * 100.0,
+        timeout_rate * 100.0,
     )
     .unwrap();
     writeln!(
@@ -327,6 +330,9 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         Duration::ZERO
     };
     let total_rate = rate_of(total_passed, total_times);
+    // 汇总百分比分母同样含超时软失败,保证对账
+    let total_denom = total_times + total_timeouts;
+    let total_timeout_rate = rate_of(total_timeouts, total_denom);
 
     writeln!(
         out,
@@ -353,7 +359,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         out,
         "Timeout   : {} ({:.1}%)",
         total_timeouts,
-        rate_of(total_timeouts, total_times) * 100.0,
+        total_timeout_rate * 100.0,
     )
     .unwrap();
     writeln!(

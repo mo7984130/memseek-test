@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::error::Error as _;
 use std::ops::Deref;
 use std::time::Duration;
 
@@ -129,7 +130,7 @@ fn reqwest_error_kind(err: &reqwest::Error) -> Cow<'static, str> {
         return "timeout".into();
     }
     if err.is_connect() {
-        return "connect".into();
+        return connect_kind(io_error_source(err));
     }
     if err.is_body() || err.is_decode() {
         return "decode".into();
@@ -141,6 +142,45 @@ fn reqwest_error_kind(err: &reqwest::Error) -> Cow<'static, str> {
         return "request".into();
     }
     "reqwest".into()
+}
+
+/// 沿错误链查找最底层的 `std::io::Error`(reqwest 连接失败通常挂在此处)。
+fn io_error_source(err: &reqwest::Error) -> Option<&std::io::Error> {
+    let mut src = err.source();
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            return Some(io);
+        }
+        src = s.source();
+    }
+    None
+}
+
+/// 连接失败细分:按 `io::ErrorKind` 归类,DNS 解析失败靠错误文本识别,
+/// 无细信息时兜底 `connect`。
+fn connect_kind(io: Option<&std::io::Error>) -> Cow<'static, str> {
+    let Some(io) = io else {
+        return "connect".into();
+    };
+    match io.kind() {
+        std::io::ErrorKind::ConnectionRefused => "connect_refused".into(),
+        std::io::ErrorKind::TimedOut => "connect_timeout".into(),
+        std::io::ErrorKind::HostUnreachable | std::io::ErrorKind::NetworkUnreachable => {
+            "connect_unreachable".into()
+        }
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+            "connect_reset".into()
+        }
+        std::io::ErrorKind::AddrNotAvailable => "connect_addr".into(),
+        _ => {
+            let detail = io.to_string().to_ascii_lowercase();
+            if detail.contains("lookup") || detail.contains("dns") || detail.contains("resolve") {
+                "connect_dns".into()
+            } else {
+                "connect".into()
+            }
+        }
+    }
 }
 
 /// 直接使用 `reqwest::Client` 时,`reqwest::Error` 也能参与报告错误分类
