@@ -37,7 +37,7 @@ impl Default for BackoffConfig {
     fn default() -> Self {
         Self {
             initial: Duration::from_millis(100),
-            max: Duration::from_secs(5),
+            max: Duration::from_secs(3),
             factor: 2.0,
         }
     }
