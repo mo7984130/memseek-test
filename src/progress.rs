@@ -139,8 +139,6 @@ struct Inner {
     /// run 成功次数(与报告 `success` 对齐)
     success: AtomicU64,
     failures: AtomicU64,
-    /// validate 成功次数(与报告 `validate_success` 对齐)
-    validate_success: AtomicU64,
     validate_failures: AtomicU64,
     /// 当前在途请求数(`begin_round` / `end_round` 维护)
     in_flight: AtomicU64,
@@ -170,7 +168,6 @@ impl Progress {
                 rounds: AtomicU64::new(0),
                 success: AtomicU64::new(0),
                 failures: AtomicU64::new(0),
-                validate_success: AtomicU64::new(0),
                 validate_failures: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 in_setup: AtomicU64::new(0),
@@ -266,9 +263,7 @@ impl Progress {
 
     /// 记录一轮 validate 结果
     pub(crate) fn validate_recorded(&self, ok: bool) {
-        if ok {
-            self.inner.validate_success.fetch_add(1, Ordering::Relaxed);
-        } else {
+        if !ok {
             self.inner.validate_failures.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -353,13 +348,28 @@ fn render_line(inner: &Inner, stopping: bool, color: bool, bar_width: usize) -> 
         rate(rounds, elapsed),
     );
 
-    // 成功/校验成功:有完成轮次后始终可见,与报告统计同源
+    // 成功/失败对账:succ = 有效通过(run 成功且 validate 通过),
+    // err = run 失败 + validate 失败;两者之和 = 已完成轮数
     if rounds > 0 {
+        let passed = inner
+            .success
+            .load(Ordering::Relaxed)
+            .saturating_sub(inner.validate_failures.load(Ordering::Relaxed));
+        let err = inner.failures.load(Ordering::Relaxed)
+            + inner.validate_failures.load(Ordering::Relaxed);
+        let _ = write!(line, "  succ {passed}");
+        if err > 0 {
+            let _ = write!(line, "  {}", paint(&format!("err {err}"), "31", color));
+        }
+    }
+
+    let failures =
+        inner.failures.load(Ordering::Relaxed) + inner.validate_failures.load(Ordering::Relaxed);
+    if failures > 0 {
         let _ = write!(
             line,
-            "  ok {}  val {}",
-            inner.success.load(Ordering::Relaxed),
-            inner.validate_success.load(Ordering::Relaxed),
+            "  {}",
+            paint(&format!("fail {failures}"), "31", color)
         );
     }
 
@@ -446,10 +456,9 @@ mod tests {
         assert!(line.contains("25.0%"), "{line}");
         assert!(line.contains("250/1000"), "{line}");
         assert!(line.contains("req/s"), "{line}");
-        // 成功/校验成功与失败并排显示
-        assert!(line.contains("ok 249"), "{line}");
-        assert!(line.contains("val 249"), "{line}");
-        assert!(line.contains("fail 1"), "{line}");
+        // 成功/失败对账:succ + err = 已完成轮数
+        assert!(line.contains("succ 249"), "{line}");
+        assert!(line.contains("err 1"), "{line}");
         // 默认无颜色
         assert!(!line.contains('\x1b'), "{line}");
         // 未进入 setup、无在途请求时不显示这些片段
@@ -471,9 +480,9 @@ mod tests {
         let line = render_line(&p.inner, true, false, 20);
         assert!(line.contains("inflight 1"), "{line}");
         assert!(line.contains("stopping..."), "{line}");
-        // 无轮次完成时不显示 ok/val
-        assert!(!line.contains("ok "), "{line}");
-        assert!(!line.contains("val "), "{line}");
+        // 无轮次完成时不显示 succ/err
+        assert!(!line.contains("succ"), "{line}");
+        assert!(!line.contains("err"), "{line}");
     }
 
     #[test]
@@ -514,9 +523,10 @@ mod tests {
     #[test]
     fn color_option_paints_failures() {
         let p = Progress::new("scn", ProgressPlan::Rounds(1), None, 0, 1);
+        p.round_recorded();
         p.result_recorded(false);
         let line = render_line(&p.inner, false, true, 20);
-        assert!(line.contains("\x1b[31mfail 1\x1b[0m"), "{line}");
+        assert!(line.contains("\x1b[31merr 1\x1b[0m"), "{line}");
     }
 
     #[test]
