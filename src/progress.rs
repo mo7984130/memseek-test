@@ -455,7 +455,7 @@ mod tests {
         );
         let line = render_line(&p.inner, false, false, 20);
         assert!(line.contains("0.0%"), "{line}");
-        assert!(line.contains("/600.00s"), "{line}");
+        assert!(line.contains("/600000.00ms"), "{line}");
     }
 
     #[test]

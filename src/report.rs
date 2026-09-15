@@ -66,13 +66,13 @@ impl Display for ScenarioReport {
         writeln!(f, "Scenario: {}", self.name)?;
         writeln!(f, "  Times: {}", self.times)?;
         writeln!(f, "  Concurrency: {}", self.concurrency)?;
-        writeln!(f, "  Total: {:?}", self.total)?;
-        writeln!(f, "  Min:  {:?}", self.min)?;
-        writeln!(f, "  Avg:  {:?}", self.avg)?;
-        writeln!(f, "  Max:  {:?}", self.max)?;
-        writeln!(f, "  P50:  {:?}", self.p50)?;
-        writeln!(f, "  P95:  {:?}", self.p95)?;
-        writeln!(f, "  P99:  {:?}", self.p99)?;
+        writeln!(f, "  Total: {}", fmt_duration(self.total))?;
+        writeln!(f, "  Min:  {}", fmt_duration(self.min))?;
+        writeln!(f, "  Avg:  {}", fmt_duration(self.avg))?;
+        writeln!(f, "  Max:  {}", fmt_duration(self.max))?;
+        writeln!(f, "  P50:  {}", fmt_duration(self.p50))?;
+        writeln!(f, "  P95:  {}", fmt_duration(self.p95))?;
+        writeln!(f, "  P99:  {}", fmt_duration(self.p99))?;
 
         writeln!(f, "  Validate Success:  {}", self.validate_success)?;
         writeln!(f, "  Validate Failures: {}", self.validate_failures)?;
@@ -480,16 +480,7 @@ pub(crate) fn bar(fraction: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-/// 可读化 Duration,按量级自适应单位
+/// 可读化 Duration:一律以毫秒(ms)为单位,便于跨场景对比。
 pub(crate) fn fmt_duration(d: Duration) -> String {
-    let ns = d.as_nanos();
-    if ns >= 1_000_000_000 {
-        format!("{:.2}s", ns as f64 / 1e9)
-    } else if ns >= 1_000_000 {
-        format!("{:.2}ms", ns as f64 / 1e6)
-    } else if ns >= 1_000 {
-        format!("{:.2}µs", ns as f64 / 1e3)
-    } else {
-        format!("{ns}ns")
-    }
+    format!("{:.2}ms", d.as_nanos() as f64 / 1e6)
 }

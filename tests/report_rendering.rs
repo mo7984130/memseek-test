@@ -128,7 +128,8 @@ fn duration_formatting_scales() {
         color: false,
         bar_width: 20,
     });
-    assert!(text.contains("3.00s"));
+    // 时长一律以 ms 显示(不再按量级自适应单位)
+    assert!(text.contains("3000.00ms"));
     assert!(text.contains("250.00ms"));
     assert!(text.contains("1.50ms"));
 }
