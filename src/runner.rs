@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     marker::PhantomData,
     time::{Duration, Instant},
 };
@@ -256,12 +257,15 @@ where
     ) {
         let ret = S::validate(ctx, task, setup, output).await;
         match ret {
-            Ok(validated) => {
-                recorder.record_validate(validated);
+            Ok(true) => {
+                recorder.record_validate(true);
+            }
+            Ok(false) => {
+                recorder.record_validate_failure(Cow::Borrowed("validate"));
             }
             Err(err) => {
                 recorder.log_internal(format!("{err:?}"));
-                recorder.record_validate(false);
+                recorder.record_validate_failure(err.kind());
             }
         }
     }

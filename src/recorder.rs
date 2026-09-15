@@ -203,6 +203,21 @@ impl Recorder {
         }
     }
 
+    /// 记录一次 validate 失败,并把失败类目计入错误明细(Errors 段)。
+    /// `kind` 为失败类目:validate 返回 `Err` 时传其 `kind()`,
+    /// 返回 `Ok(false)` 时传统一类目 `"validate"`。
+    pub fn record_validate_failure(&mut self, kind: Cow<'static, str>) {
+        self.validate_failures += 1;
+        self.error_map
+            .entry(kind)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        #[cfg(feature = "tui")]
+        if let Some(progress) = &self.progress {
+            progress.validate_recorded(false);
+        }
+    }
+
     /// 框架内部日志门面:TUI 激活时进日志缓冲(不再打扰终端),
     /// 否则照常落 tracing。
     pub(crate) fn log_internal(&self, message: String) {

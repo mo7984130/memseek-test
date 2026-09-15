@@ -165,6 +165,13 @@ impl Report for Vec<ScenarioReport> {
 
 // ---------- 渲染内核 ----------
 
+/// 有效通过轮数:`run` 成功且业务校验(validate)通过。
+/// validate 失败的轮次虽然计入 `success`(HTTP/业务请求本身成功),
+/// 但断言未通过,不能视为通过。
+fn passed_rounds(success: u64, validate_failures: u64) -> u64 {
+    success.saturating_sub(validate_failures)
+}
+
 fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
     let mut out = String::new();
 
@@ -182,7 +189,9 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
     )
     .unwrap();
 
-    let success_rate = rate_of(r.success, r.times);
+    // Success 指有效通过(含 validate):run 成功但断言失败的轮次另见 Validate 行
+    let passed = passed_rounds(r.success, r.validate_failures);
+    let success_rate = rate_of(passed, r.times);
     let fail_rate = rate_of(r.failures, r.times);
 
     writeln!(out, "Requests : {}", r.times).unwrap();
@@ -191,7 +200,7 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
     writeln!(
         out,
         "Success  : {} ({:.1}%) {}",
-        r.success,
+        passed,
         success_rate * 100.0,
         paint(rate_label(success_rate), rate_color(success_rate), o.color),
     )
@@ -240,9 +249,10 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
         writeln!(out).unwrap();
         writeln!(out, "Errors:").unwrap();
 
+        // 明细包含 run 失败与 validate 失败;分母为全部失败轮,保证占比对账
         let mut errs: Vec<_> = r.error_map.iter().collect();
         errs.sort_by(|a, b| b.1.cmp(a.1));
-        let denom = r.failures.max(1) as f64;
+        let denom = (r.failures + r.validate_failures).max(1) as f64;
         for (kind, count) in errs {
             let frac = *count as f64 / denom;
             writeln!(
@@ -274,6 +284,8 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     let total_validate_success: u64 = reports.iter().map(|r| r.validate_success).sum();
     let total_validate_failures: u64 = reports.iter().map(|r| r.validate_failures).sum();
     let total_total: Duration = reports.iter().map(|r| r.total).sum();
+    // 有效通过:run 成功且 validate 通过,汇总与 Overall 均以此为准
+    let total_passed = total_success.saturating_sub(total_validate_failures);
 
     // 并发度:各场景一致时显示单值,不一致时显示范围
     let first_concurrency = reports[0].concurrency;
@@ -293,7 +305,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     } else {
         Duration::ZERO
     };
-    let total_rate = rate_of(total_success, total_times);
+    let total_rate = rate_of(total_passed, total_times);
 
     writeln!(
         out,
@@ -309,7 +321,7 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     writeln!(
         out,
         "Success   : {} ({:.1}%) {}",
-        total_success,
+        total_passed,
         total_rate * 100.0,
         paint(rate_label(total_rate), rate_color(total_rate), o.color),
     )
@@ -371,7 +383,8 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     writeln!(out, "{}", paint(&header, "36", o.color)).unwrap();
 
     for r in reports {
-        let rate = rate_of(r.success, r.times);
+        // Rate 为有效通过率:run 成功且 validate 通过
+        let rate = rate_of(passed_rounds(r.success, r.validate_failures), r.times);
         writeln!(
             out,
             "{:<name_w$} {:>8} {:>10} {:>10} {:>8} {:>10} {:>10} {:>12}",
@@ -397,9 +410,10 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         for r in err_rows {
             writeln!(out, "{}", paint(&format!("  {}.", r.name), "1", o.color)).unwrap();
 
+            // 明细包含 run 失败与 validate 失败;分母为全部失败轮,保证占比对账
             let mut errs: Vec<_> = r.error_map.iter().collect();
             errs.sort_by(|a, b| b.1.cmp(a.1));
-            let denom = r.failures.max(1) as f64;
+            let denom = (r.failures + r.validate_failures).max(1) as f64;
             for (kind, count) in errs {
                 let frac = *count as f64 / denom;
                 writeln!(
@@ -431,11 +445,11 @@ pub(crate) fn paint(s: &str, code: &str, enabled: bool) -> String {
     }
 }
 
-fn rate_of(success: u64, total: u64) -> f64 {
+fn rate_of(passed: u64, total: u64) -> f64 {
     if total == 0 {
         0.0
     } else {
-        success as f64 / total as f64
+        passed as f64 / total as f64
     }
 }
 

@@ -40,7 +40,8 @@ fn single_report_contains_core_stats() {
 
     assert!(text.contains("login"));
     assert!(text.contains("Requests : 100"));
-    assert!(text.contains("98 (98.0%)"));
+    // Success 为有效通过(run 成功且 validate 通过):98 - 2 = 96
+    assert!(text.contains("96 (96.0%)"));
     assert!(text.contains("2 (2.0%)"));
     assert!(text.contains("Latency"));
     assert!(text.contains("P95"));
@@ -80,7 +81,8 @@ fn vec_report_has_summary_and_table() {
     assert!(text.contains("Scenarios : 2"));
     assert!(text.contains("Concurrent : 16"));
     assert!(text.contains("Requests  : 1500"));
-    assert!(text.contains("Success   : 1398 (93.2%)"));
+    // Success 为有效通过(run 成功且 validate 通过):1398 - 102 = 1296
+    assert!(text.contains("Success   : 1296 (86.4%)"));
     assert!(text.contains("login"));
     assert!(text.contains("order"));
     assert!(text.contains("Per-scenario"));

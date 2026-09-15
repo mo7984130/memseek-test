@@ -206,6 +206,33 @@ impl Scenario for BadOutputScenario {
 
 register_scenario!(BadOutputScenario);
 
+/// `run` 成功且产出满足校验,但 validate 自身返回 `Err`(抛错),
+/// 同样计入一次 validate 失败,并以 `Error::kind()` 作为错误类目。
+#[derive(Default)]
+struct ValidateErrorScenario;
+
+impl Scenario for ValidateErrorScenario {
+    type Ctx = AuthContext;
+    type Error = TestError;
+    type Output = u32;
+    type Setup = ();
+
+    async fn run(_ctx: &AuthContext, _task: &TaskIndex, _setup: &()) -> Result<u32, Self::Error> {
+        Ok(42)
+    }
+
+    async fn validate(
+        _ctx: &AuthContext,
+        _task: &TaskIndex,
+        _setup: &(),
+        _output: &u32,
+    ) -> Result<bool, Self::Error> {
+        Err(TestError)
+    }
+}
+
+register_scenario!(ValidateErrorScenario);
+
 #[test]
 fn validate_failure_is_recorded() {
     let ctx = AuthContext;
@@ -220,10 +247,31 @@ fn validate_failure_is_recorded() {
             .run_one::<AuthContext>("BadOutputScenario", &ctx)
             .await
             .expect("scenario should be found");
-        // run 成功,但 validate 断言失败
+        // run 成功,但 validate 断言失败(Ok(false) -> 统一类目 "validate")
         assert_eq!(report.success, 1);
         assert_eq!(report.validate_success, 0);
         assert_eq!(report.validate_failures, 1);
+        assert_eq!(report.error_map.get("validate"), Some(&1));
+    });
+}
+
+#[test]
+fn validate_error_is_recorded_with_kind() {
+    let ctx = AuthContext;
+    let manager = ScenarioManager::new(ManagerConfig::new(1).with_run_mode(RunMode::Times(1)));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let report = manager
+            .run_one::<AuthContext>("ValidateErrorScenario", &ctx)
+            .await
+            .expect("scenario should be found");
+        // validate 返回 Err:以 `Error::kind()` 计入错误明细
+        assert_eq!(report.validate_failures, 1);
+        assert_eq!(report.error_map.get("test"), Some(&1));
     });
 }
 
