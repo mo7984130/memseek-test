@@ -136,7 +136,11 @@ struct Inner {
     started: Instant,
     /// 已完成轮数(与报告 `times` 对齐:由 `record_duration` 累加)
     rounds: AtomicU64,
+    /// run 成功次数(与报告 `success` 对齐)
+    success: AtomicU64,
     failures: AtomicU64,
+    /// validate 成功次数(与报告 `validate_success` 对齐)
+    validate_success: AtomicU64,
     validate_failures: AtomicU64,
     /// 当前在途请求数(`begin_round` / `end_round` 维护)
     in_flight: AtomicU64,
@@ -164,7 +168,9 @@ impl Progress {
                 scenario_total,
                 started: Instant::now(),
                 rounds: AtomicU64::new(0),
+                success: AtomicU64::new(0),
                 failures: AtomicU64::new(0),
+                validate_success: AtomicU64::new(0),
                 validate_failures: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 in_setup: AtomicU64::new(0),
@@ -251,14 +257,18 @@ impl Progress {
 
     /// 记录一轮 run 结果
     pub(crate) fn result_recorded(&self, ok: bool) {
-        if !ok {
+        if ok {
+            self.inner.success.fetch_add(1, Ordering::Relaxed);
+        } else {
             self.inner.failures.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// 记录一轮 validate 结果
     pub(crate) fn validate_recorded(&self, ok: bool) {
-        if !ok {
+        if ok {
+            self.inner.validate_success.fetch_add(1, Ordering::Relaxed);
+        } else {
             self.inner.validate_failures.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -343,6 +353,16 @@ fn render_line(inner: &Inner, stopping: bool, color: bool, bar_width: usize) -> 
         rate(rounds, elapsed),
     );
 
+    // 成功/校验成功:有完成轮次后始终可见,与报告统计同源
+    if rounds > 0 {
+        let _ = write!(
+            line,
+            "  ok {}  val {}",
+            inner.success.load(Ordering::Relaxed),
+            inner.validate_success.load(Ordering::Relaxed),
+        );
+    }
+
     let failures =
         inner.failures.load(Ordering::Relaxed) + inner.validate_failures.load(Ordering::Relaxed);
     if failures > 0 {
@@ -412,7 +432,13 @@ mod tests {
         for _ in 0..250 {
             p.round_recorded();
         }
+        for _ in 0..249 {
+            p.result_recorded(true);
+        }
         p.result_recorded(false);
+        for _ in 0..249 {
+            p.validate_recorded(true);
+        }
 
         let line = render_line(&p.inner, false, false, 20);
         assert!(line.contains("login"), "{line}");
@@ -420,6 +446,9 @@ mod tests {
         assert!(line.contains("25.0%"), "{line}");
         assert!(line.contains("250/1000"), "{line}");
         assert!(line.contains("req/s"), "{line}");
+        // 成功/校验成功与失败并排显示
+        assert!(line.contains("ok 249"), "{line}");
+        assert!(line.contains("val 249"), "{line}");
         assert!(line.contains("fail 1"), "{line}");
         // 默认无颜色
         assert!(!line.contains('\x1b'), "{line}");
@@ -442,6 +471,9 @@ mod tests {
         let line = render_line(&p.inner, true, false, 20);
         assert!(line.contains("inflight 1"), "{line}");
         assert!(line.contains("stopping..."), "{line}");
+        // 无轮次完成时不显示 ok/val
+        assert!(!line.contains("ok "), "{line}");
+        assert!(!line.contains("val "), "{line}");
     }
 
     #[test]
