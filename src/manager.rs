@@ -162,6 +162,10 @@ impl ScenarioManager {
         scenario_index: usize,
         scenario_total: usize,
     ) -> ScenarioReport {
+        // 非 TUI 编译时这两个参数仅用于进度显示,此处消音
+        #[cfg(not(feature = "tui"))]
+        let _ = (scenario_index, scenario_total);
+
         let mode = self
             .config
             .run_mode
