@@ -1,13 +1,16 @@
-use std::{any::Any, time::Instant};
+use std::{any::Any, panic, time::Instant};
 
 use futures::future::join_all;
+use tokio::runtime::RuntimeFlavor;
+use tracing::warn;
 
 #[cfg(feature = "tui")]
 use crate::progress::{Progress, ProgressGuard, ProgressPlan};
 #[cfg(feature = "tui")]
 use crate::tui::TuiOptions;
 use crate::{
-    registry::{ScenarioRegistration, ScenarioRegistry},
+    recorder::Recorder,
+    registry::{ScenarioInvoke, ScenarioRegistration, ScenarioRegistry},
     report::ScenarioReport,
     runner::{BackoffConfig, RunMode, RunnerConfig},
     shutdown::Shutdown,
@@ -17,6 +20,8 @@ use crate::{
 pub struct ManagerConfig {
     /// 并发度
     concurrency: u64,
+    /// 驱动并发任务的线程数(分片数),默认 1
+    workers: u64,
     /// 运行模式, 存在的情况下会覆盖scenario配置
     run_mode: Option<RunMode>,
     /// 超时退避;`None` 表示超时后立即进入下一轮(默认)
@@ -34,12 +39,34 @@ impl ManagerConfig {
         }
         Self {
             concurrency,
+            workers: 1,
             run_mode: None,
             backoff: None,
             shutdown: None,
             #[cfg(feature = "tui")]
             tui: None,
         }
+    }
+
+    /// 用多个线程驱动并发任务(默认 1 个,即在当前 runtime 上协作调度)。
+    ///
+    /// `workers > 1` 时,并发任务按连续区间分片到等量的框架自建线程,
+    /// 每线程一个 `current_thread` runtime;分片内仍按 `join_all` 协作调度。
+    /// 目的:让 CPU 密集的任务真正并行,避免单线程的自伤延迟。
+    ///
+    /// 只改变"由哪个线程驱动",不改变施加的并发:`task_index`/`task_total`
+    /// 仍为全局编号,报告口径与 RPS 计算不变;`workers` 超过并发度时按并发度裁剪。
+    ///
+    /// 注意:分片执行会阻塞调用线程(等价于 `block_on` 的语义),应由
+    /// `block_on` 的顶层调用;若调用方 runtime 是 `current_thread`,
+    /// 分片期间已 spawn 的后台任务(TUI 渲染、Ctrl-C 监听)将得不到调度,
+    /// 此时请改用多线程 runtime 或保持 `workers = 1`(会给出告警)。
+    pub fn with_workers(mut self, workers: u64) -> Self {
+        if workers == 0 {
+            panic!("Manager Config workers cannot be zero");
+        }
+        self.workers = workers;
+        self
     }
 
     pub fn with_run_mode(mut self, run_mode: RunMode) -> Self {
@@ -168,7 +195,8 @@ impl ScenarioManager {
     async fn run_entry(
         &self,
         entry: &ScenarioRegistration,
-        ctx: &dyn Any,
+        // 需 `Sync` 才能 `&Ctx` 跨线程分片(见 `run_tasks`)
+        ctx: &(dyn Any + Sync),
         shutdown: Option<&Shutdown>,
         scenario_index: usize,
         scenario_total: usize,
@@ -242,8 +270,7 @@ impl ScenarioManager {
 
         // 墙钟耗时:整个场景从分发到全部任务结束,用于报告 RPS
         let start = Instant::now();
-        let futures: Vec<_> = cfgs.iter().map(|c| (entry.invoke)(ctx, c)).collect();
-        let results = join_all(futures).await;
+        let results = run_tasks(ctx, entry.invoke, cfgs, self.config.workers).await;
         let elapsed = start.elapsed();
 
         // 所有轮次结束后停止渲染,等渲染任务收尾(恢复屏幕),
@@ -279,4 +306,79 @@ impl ScenarioManager {
         }
         ScenarioReport::from_recorder(entry.name, merged, self.config.concurrency, elapsed)
     }
+}
+
+/// 分发并发任务并汇总结果。
+///
+/// `workers == 1`(默认)在当前 runtime 上以 `join_all` 协作调度;`workers > 1`
+/// 时按连续区间分片到等量线程,每线程一个 `current_thread` runtime 真正并行
+/// (分片内仍协作调度)。分片只决定驱动线程:`task_index`/`task_total` 保持全局
+/// 编号,因此参数化与统计口径不变。
+async fn run_tasks(
+    ctx: &(dyn Any + Sync),
+    invoke: ScenarioInvoke,
+    cfgs: Vec<RunnerConfig>,
+    workers: u64,
+) -> Vec<Recorder> {
+    let workers = (workers.max(1) as usize).min(cfgs.len().max(1));
+    if workers <= 1 {
+        let futures: Vec<_> = cfgs.iter().map(|c| invoke(ctx, c)).collect();
+        return join_all(futures).await;
+    }
+
+    // 分片会阻塞调用线程:current_thread runtime 下已 spawn 的后台任务
+    // (TUI 渲染、Ctrl-C 监听)会饿死,这里给出显式提示。
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| matches!(h.runtime_flavor(), RuntimeFlavor::CurrentThread))
+    {
+        warn!(
+            "workers = {workers} blocks the caller thread for the whole scenario; \
+             on a current_thread runtime, spawned tasks (TUI rendering, Ctrl-C listener) \
+             will starve — use a multi-thread runtime or keep workers = 1"
+        );
+    }
+
+    // 连续分片:前 `rem` 个分片各多担一个任务
+    let base = cfgs.len() / workers;
+    let rem = cfgs.len() % workers;
+    let mut shards: Vec<Vec<RunnerConfig>> = Vec::with_capacity(workers);
+    let mut rest = cfgs.into_iter();
+    for k in 0..workers {
+        let n = base + usize::from(k < rem);
+        shards.push(rest.by_ref().take(n).collect());
+    }
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = shards
+            .into_iter()
+            .map(|shard| {
+                scope.spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build workers runtime failed");
+                    let futures: Vec<_> = shard.iter().map(|c| invoke(ctx, c)).collect();
+                    rt.block_on(join_all(futures))
+                })
+            })
+            .collect();
+
+        // 即便某个分片 panic,也先等其余分片收尾,再把 panic 原样抛给调用方
+        let mut results = Vec::with_capacity(handles.len());
+        let mut panicked = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(recorders) => results.push(recorders),
+                Err(payload) => {
+                    if panicked.is_none() {
+                        panicked = Some(payload);
+                    }
+                }
+            }
+        }
+        if let Some(payload) = panicked {
+            panic::resume_unwind(payload);
+        }
+        results.into_iter().flatten().collect()
+    })
 }
