@@ -11,7 +11,12 @@ pub enum SetupMode {
     Round,
 }
 
-/// 框架按单线程 `block_on` + `join_all` 调度,不 `tokio::spawn`,
+/// `teardown()` 阶段的执行粒度,与 [`SetupMode`] 同义:
+/// `Task` = 每个任务在轮次循环结束后一次,`Round` = 每轮一次。
+pub type TeardownMode = SetupMode;
+
+/// 框架按 `block_on` + `join_all` 调度(默认单线程协作;
+/// 可用 `ManagerConfig::with_workers` 分片到多个自建线程),不 `tokio::spawn`,
 /// 因此不要求方法返回的 Future `Send`;若未来需要 spawn,
 /// 应改为返回 `impl Future + Send` 的手写形态。
 #[allow(async_fn_in_trait)]
@@ -28,6 +33,15 @@ pub trait Scenario: Default + Send + Sync + 'static {
 
     /// `setup` 执行粒度,默认每个任务一次(`SetupMode::Task`)。
     const SETUP_MODE: SetupMode = SetupMode::Task;
+
+    /// `teardown` 执行粒度,默认每个任务一次(`TeardownMode::Task`)。
+    ///
+    /// - `Task`:每个任务在轮次循环结束后执行一次(含被优雅关闭提前结束的路径);
+    /// - `Round`:每轮 `run`/`validate` 之后执行一次,能拿到本轮 `setup` 与 `run` 产出。
+    ///
+    /// 需要清理**每轮创建的资源**(如每轮下单后删除订单)时应设为 `Round`:
+    /// 任务级收尾拿不到任何一轮的 `Output`。
+    const TEARDOWN_MODE: TeardownMode = TeardownMode::Task;
 
     /// 场景展示名。
     ///
@@ -74,5 +88,30 @@ pub trait Scenario: Default + Send + Sync + 'static {
         _output: &Self::Output,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+
+    /// 收尾阶段(finally 语义),默认什么都不做。
+    ///
+    /// 按 [`Self::TEARDOWN_MODE`] 决定执行频率;`run`/`validate` **无论成败**都会
+    /// 执行(不同于只在 `run` 成功时执行的 `validate`),且不可被停止信号打断。
+    ///
+    /// `result` 为对应轮次 `run` 的结果:`Round` 粒度恒为 `Some(Ok/Err)`;
+    /// `Task` 粒度没有单轮产出,恒为 `None`。
+    ///
+    /// 失败处理:返回 `Err` 记一次 teardown 失败(以 `teardown:{kind}` 进错误明细),
+    /// **不**加剧 `failures`/`timeouts`、不触发退避、不影响通过率,也不中止任务
+    /// (收尾失败不应中断压测)。
+    ///
+    /// 边界:`setup` 未成功(普通失败 / 首轮前被取消)时不执行任务级收尾;
+    /// `SetupMode::Round` 且本轮 setup 失败时不执行本轮收尾。
+    /// 另注:`SetupMode::Round` 搭配 `TeardownMode::Task` 时,任务级收尾拿到的是
+    /// **最后一次成功 setup** 的产出(若从未成功 setup 过则不执行收尾)。
+    async fn teardown(
+        _ctx: &Self::Ctx,
+        _task: &TaskIndex,
+        _setup: &Self::Setup,
+        _result: Option<Result<&Self::Output, &Self::Error>>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 }

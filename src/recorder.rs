@@ -24,6 +24,15 @@ pub struct Recorder {
 
     pub validate_success: u64,
     pub validate_failures: u64,
+    /// 各任务 `setup` 尝试耗时之和(含超时重试的每次尝试;与墙钟口径不同)
+    pub setup_total: Duration,
+    /// 各轮 `validate` 耗时之和
+    pub validate_total: Duration,
+    /// 各次 `teardown` 耗时之和
+    pub teardown_total: Duration,
+    /// 收尾成功/失败次数(失败不加剧 `failures`,单列统计)
+    pub teardown_success: u64,
+    pub teardown_failures: u64,
     /// 该任务是否因优雅关闭(停止信号)提前结束
     pub interrupted: bool,
 }
@@ -47,6 +56,11 @@ impl Recorder {
             error_map: HashMap::new(),
             validate_success: 0,
             validate_failures: 0,
+            setup_total: Duration::ZERO,
+            validate_total: Duration::ZERO,
+            teardown_total: Duration::ZERO,
+            teardown_success: 0,
+            teardown_failures: 0,
             interrupted: false,
         }
     }
@@ -119,6 +133,11 @@ impl Recorder {
 
         self.validate_success += other.validate_success;
         self.validate_failures += other.validate_failures;
+        self.setup_total += other.setup_total;
+        self.validate_total += other.validate_total;
+        self.teardown_total += other.teardown_total;
+        self.teardown_success += other.teardown_success;
+        self.teardown_failures += other.teardown_failures;
         self.interrupted |= other.interrupted;
         // 合并发生在所有轮次结束之后:汇合后的 Recorder 不再上报进度,
         // 避免误用时对共享计数二次累加
@@ -243,6 +262,45 @@ impl Recorder {
             return;
         }
         warn!("{message}");
+    }
+
+    /// 记录一次 setup 尝试的耗时:超时退避后的每次重试都单独计入。
+    pub fn record_setup_duration(&mut self, duration: Duration) {
+        self.setup_total += duration;
+    }
+
+    /// 记录一次 validate 的耗时。
+    pub fn record_validate_duration(&mut self, duration: Duration) {
+        self.validate_total += duration;
+    }
+
+    /// 记录一次 teardown 的耗时。
+    pub fn record_teardown_duration(&mut self, duration: Duration) {
+        self.teardown_total += duration;
+    }
+
+    /// 记录一次 teardown 结果。失败不加剧 `failures`/`timeouts`(那两项只反映
+    /// 荷载路径的成败),故单列计数;错误类目由 [`Self::record_teardown_error`] 记录。
+    pub fn record_teardown(&mut self, ok: bool) {
+        if ok {
+            self.teardown_success += 1;
+        } else {
+            self.teardown_failures += 1;
+        }
+        #[cfg(feature = "tui")]
+        if let Some(progress) = &self.progress {
+            progress.teardown_recorded(ok);
+        }
+    }
+
+    /// 记录一次 teardown 失败的类目,自动加 `teardown:` 前缀,
+    /// 便于在错误明细里与 run 侧失败区分。
+    pub fn record_teardown_error(&mut self, kind: Cow<'static, str>) {
+        let key: Cow<'static, str> = format!("teardown:{kind}").into();
+        self.error_map
+            .entry(key)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
     }
 
     /// 标记该任务因优雅关闭提前结束(计入报告)。

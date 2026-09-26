@@ -9,7 +9,7 @@ use crate::progress::Progress;
 use crate::{
     error::ScenarioError,
     recorder::Recorder,
-    scenario::{Scenario, SetupMode},
+    scenario::{Scenario, SetupMode, TeardownMode},
     shutdown::Shutdown,
 };
 
@@ -110,6 +110,48 @@ enum SetupDone<S> {
     Cancelled,
 }
 
+/// 轮次预算:`Times` 按次数消耗,`Duration` 按墙钟消耗。
+///
+/// 两种执行模式共用同一套轮次循环骨架(取消检查 → 轮级 setup →
+/// 轮体 run/validate/teardown → 退避),预算只决定"是否还有下一轮"。
+#[derive(Clone, Copy, Debug)]
+enum RoundBudget {
+    Times {
+        left: u64,
+    },
+    /// 剩余时长,每轮按该轮实际耗时(含 setup 与 teardown)扣减
+    Duration {
+        remaining: Duration,
+    },
+}
+
+impl RoundBudget {
+    const fn new(mode: RunMode) -> Self {
+        match mode {
+            RunMode::Times(times) => Self::Times { left: times },
+            RunMode::Duration(duration) => Self::Duration {
+                remaining: duration,
+            },
+        }
+    }
+
+    /// 是否还有预算执行下一轮
+    fn has_next(&self) -> bool {
+        match self {
+            Self::Times { left } => *left > 0,
+            Self::Duration { remaining } => !remaining.is_zero(),
+        }
+    }
+
+    /// 记一轮的消耗
+    fn spend(&mut self, elapsed: Duration) {
+        match self {
+            Self::Times { left } => *left = left.saturating_sub(1),
+            Self::Duration { remaining } => *remaining = remaining.saturating_sub(elapsed),
+        }
+    }
+}
+
 impl<S> ScenarioRunner<S>
 where
     S: Scenario,
@@ -122,28 +164,14 @@ where
         }
     }
 
-    /// 执行并记录一轮 `run`,成功时进入 `validate`。
-    /// 返回该轮是否超时(用于触发退避)。
-    async fn run_and_validate(
-        ctx: &S::Ctx,
-        task: &TaskIndex,
-        setup: &S::Setup,
-        recorder: &mut Recorder,
-    ) -> bool {
-        let result = Self::once(ctx, task, setup, recorder).await;
-        let timed_out = result.as_ref().is_err_and(|e| e.is_timeout());
-        // run 失败已记录,不再进入 validate
-        if let Ok(output) = &result {
-            Self::validate(ctx, task, setup, output, recorder).await;
-        }
-        timed_out
-    }
-
     pub async fn run(&self, ctx: &S::Ctx) -> Recorder {
         let mut recorder = Recorder::from_config(&self.config);
 
         // 优雅关闭:信号到达时已完成当前轮次,不再启动新轮次。
         // 各分支在 setup 后/每轮开始前检查。
+        // 退避状态在 setup 与各轮之间共享:任意非超时结果(系统恢复)后复位。
+        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
+
         match S::SETUP_MODE {
             SetupMode::Task => {
                 if self.is_cancelled() {
@@ -151,20 +179,12 @@ where
                     return recorder;
                 }
                 // setup 任务级一次(round 无轮次含义,固定 0),产出供各轮复用
-                let setup_task = TaskIndex::new(self.config.task_index, self.config.task_total, 0);
+                let task = TaskIndex::new(self.config.task_index, self.config.task_total, 0);
                 #[cfg(feature = "tui")]
                 recorder.begin_setup();
-                // 退避状态在 setup 与 run 轮次间共享:任意成功(系统恢复)后复位
-                let mut backoff_wait = Self::backoff_initial(self.config.backoff);
-                let setup = match Self::setup_retrying(
-                    ctx,
-                    &setup_task,
-                    &mut recorder,
-                    self.config.shutdown.as_ref(),
-                    self.config.backoff,
-                    &mut backoff_wait,
-                )
-                .await
+                let setup = match self
+                    .setup_retrying(ctx, &task, &mut recorder, &mut backoff_wait)
+                    .await
                 {
                     SetupDone::Ready(setup) => setup,
                     SetupDone::Failed => return recorder,
@@ -178,174 +198,61 @@ where
                 // setup 期间收到信号:等 setup 完成后直接退出,不进入 run 循环
                 if self.is_cancelled() {
                     recorder.record_interrupted();
-                    return recorder;
+                } else {
+                    self.drive_rounds(ctx, &setup, &mut recorder, &mut backoff_wait)
+                        .await;
                 }
-                match self.config.mode {
-                    RunMode::Times(times) => {
-                        for round in 0..times {
-                            if self.is_cancelled() {
-                                recorder.record_interrupted();
-                                break;
-                            }
-                            let task = TaskIndex::new(
-                                self.config.task_index,
-                                self.config.task_total,
-                                round as usize,
-                            );
-                            if Self::run_round(
-                                ctx,
-                                &task,
-                                &setup,
-                                &mut recorder,
-                                self.config.shutdown.as_ref(),
-                                self.config.backoff,
-                                &mut backoff_wait,
-                            )
-                            .await
-                            {
-                                recorder.record_interrupted();
-                                break;
-                            }
-                        }
-                    }
-                    RunMode::Duration(duration) => {
-                        let mut remaining = duration;
-                        let mut round = 0usize;
-
-                        while !remaining.is_zero() {
-                            if self.is_cancelled() {
-                                recorder.record_interrupted();
-                                break;
-                            }
-                            let start = Instant::now();
-                            let task = TaskIndex::new(
-                                self.config.task_index,
-                                self.config.task_total,
-                                round,
-                            );
-                            round += 1;
-
-                            if Self::run_round(
-                                ctx,
-                                &task,
-                                &setup,
-                                &mut recorder,
-                                self.config.shutdown.as_ref(),
-                                self.config.backoff,
-                                &mut backoff_wait,
-                            )
-                            .await
-                            {
-                                recorder.record_interrupted();
-                                break;
-                            }
-
-                            remaining = remaining.saturating_sub(start.elapsed());
-                        }
-                    }
+                // 任务级收尾:finally 语义(取消后也执行);setup 成功过才会走到这里
+                if S::TEARDOWN_MODE == TeardownMode::Task {
+                    Self::teardown(ctx, &task, &setup, None, &mut recorder).await;
                 }
             }
             SetupMode::Round => {
-                // setup 每轮一次:普通失败中止任务,超时退避重试
-                match self.config.mode {
-                    RunMode::Times(times) => {
-                        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
-                        for round in 0..times {
-                            if self.is_cancelled() {
-                                recorder.record_interrupted();
-                                break;
-                            }
-                            let task = TaskIndex::new(
-                                self.config.task_index,
-                                self.config.task_total,
-                                round as usize,
-                            );
-                            let setup = match Self::setup_retrying(
-                                ctx,
-                                &task,
-                                &mut recorder,
-                                self.config.shutdown.as_ref(),
-                                self.config.backoff,
-                                &mut backoff_wait,
-                            )
-                            .await
-                            {
-                                SetupDone::Ready(setup) => setup,
-                                SetupDone::Failed => return recorder,
-                                SetupDone::Cancelled => {
-                                    recorder.record_interrupted();
-                                    break;
-                                }
-                            };
-                            if Self::run_round(
-                                ctx,
-                                &task,
-                                &setup,
-                                &mut recorder,
-                                self.config.shutdown.as_ref(),
-                                self.config.backoff,
-                                &mut backoff_wait,
-                            )
-                            .await
-                            {
-                                recorder.record_interrupted();
-                                break;
-                            }
-                        }
+                let mut budget = RoundBudget::new(self.config.mode);
+                let mut round = 0usize;
+                // 轮级 setup 的产出仅本轮有效;任务级收尾(TEARDOWN_MODE = Task)
+                // 需要一个 setup 借用,这里保留最近一次成功的产出供其使用。
+                let mut last: Option<(TaskIndex, S::Setup)> = None;
+
+                while budget.has_next() {
+                    if self.is_cancelled() {
+                        recorder.record_interrupted();
+                        break;
                     }
-                    RunMode::Duration(duration) => {
-                        let mut remaining = duration;
-                        let mut round = 0usize;
-                        let mut backoff_wait = Self::backoff_initial(self.config.backoff);
+                    let start = Instant::now();
+                    let task =
+                        TaskIndex::new(self.config.task_index, self.config.task_total, round);
+                    round += 1;
 
-                        while !remaining.is_zero() {
-                            if self.is_cancelled() {
-                                recorder.record_interrupted();
-                                break;
-                            }
-                            let start = Instant::now();
-                            let task = TaskIndex::new(
-                                self.config.task_index,
-                                self.config.task_total,
-                                round,
-                            );
-                            round += 1;
-                            let setup = match Self::setup_retrying(
-                                ctx,
-                                &task,
-                                &mut recorder,
-                                self.config.shutdown.as_ref(),
-                                self.config.backoff,
-                                &mut backoff_wait,
-                            )
-                            .await
-                            {
-                                SetupDone::Ready(setup) => setup,
-                                SetupDone::Failed => return recorder,
-                                SetupDone::Cancelled => {
-                                    recorder.record_interrupted();
-                                    break;
-                                }
-                            };
-
-                            if Self::run_round(
-                                ctx,
-                                &task,
-                                &setup,
-                                &mut recorder,
-                                self.config.shutdown.as_ref(),
-                                self.config.backoff,
-                                &mut backoff_wait,
-                            )
-                            .await
-                            {
-                                recorder.record_interrupted();
-                                break;
-                            }
-
-                            remaining = remaining.saturating_sub(start.elapsed());
+                    let setup = match self
+                        .setup_retrying(ctx, &task, &mut recorder, &mut backoff_wait)
+                        .await
+                    {
+                        SetupDone::Ready(setup) => setup,
+                        // 普通失败:中止任务(不再启动新轮次)
+                        SetupDone::Failed => break,
+                        SetupDone::Cancelled => {
+                            recorder.record_interrupted();
+                            break;
                         }
+                    };
+
+                    let entry = (task, setup);
+                    let stopped = self
+                        .round(ctx, &entry.0, &entry.1, &mut recorder, &mut backoff_wait)
+                        .await;
+                    budget.spend(start.elapsed());
+                    last = Some(entry);
+                    if stopped {
+                        recorder.record_interrupted();
+                        break;
                     }
+                }
+
+                if S::TEARDOWN_MODE == TeardownMode::Task
+                    && let Some((task, setup)) = last.as_ref()
+                {
+                    Self::teardown(ctx, task, setup, None, &mut recorder).await;
                 }
             }
         }
@@ -353,24 +260,55 @@ where
         recorder
     }
 
+    /// `SetupMode::Task` 下的轮次循环:每轮复用同一份 setup 产出。
+    async fn drive_rounds(
+        &self,
+        ctx: &S::Ctx,
+        setup: &S::Setup,
+        recorder: &mut Recorder,
+        wait: &mut Duration,
+    ) {
+        let mut budget = RoundBudget::new(self.config.mode);
+        let mut round = 0usize;
+
+        while budget.has_next() {
+            if self.is_cancelled() {
+                recorder.record_interrupted();
+                return;
+            }
+            let task = TaskIndex::new(self.config.task_index, self.config.task_total, round);
+            round += 1;
+
+            let start = Instant::now();
+            if self.round(ctx, &task, setup, recorder, wait).await {
+                recorder.record_interrupted();
+                return;
+            }
+            budget.spend(start.elapsed());
+        }
+    }
+
     /// 退避初始值:未配置退避时用零占位(不产生等待)。
     fn backoff_initial(backoff: Option<BackoffConfig>) -> Duration {
         backoff.map(|b| b.initial).unwrap_or(Duration::ZERO)
     }
 
-    /// 执行 setup,失败时处理同 `run_round` 的退避语义:
+    /// 执行 setup,失败时处理同轮体的退避语义:
     /// 超时 → 退避后重试(可被停止信号打断);普通失败或未配置退避时中止。
+    /// 每次尝试的耗时计入 setup 统计。
     async fn setup_retrying(
+        &self,
         ctx: &S::Ctx,
         task: &TaskIndex,
         recorder: &mut Recorder,
-        shutdown: Option<&Shutdown>,
-        backoff: Option<BackoffConfig>,
         wait: &mut Duration,
     ) -> SetupDone<S::Setup> {
-        let Some(cfg) = backoff else {
+        let Some(cfg) = self.config.backoff else {
             // 未配置退避:保持旧语义,失败即中止
-            return match S::setup(ctx, task).await {
+            let start = Instant::now();
+            let ret = S::setup(ctx, task).await;
+            recorder.record_setup_duration(start.elapsed());
+            return match ret {
                 Ok(setup) => SetupDone::Ready(setup),
                 Err(err) => {
                     recorder.record_result(&Err::<(), S::Error>(err));
@@ -379,7 +317,10 @@ where
             };
         };
         loop {
-            match S::setup(ctx, task).await {
+            let start = Instant::now();
+            let ret = S::setup(ctx, task).await;
+            recorder.record_setup_duration(start.elapsed());
+            match ret {
                 Ok(setup) => {
                     if *wait != cfg.initial {
                         *wait = cfg.initial;
@@ -392,7 +333,7 @@ where
                     if !timed_out {
                         return SetupDone::Failed;
                     }
-                    if Self::wait_or_cancel(shutdown, *wait).await {
+                    if self.wait_or_cancel(*wait).await {
                         return SetupDone::Cancelled;
                     }
                     // 指数增长,封顶 max,不低于 initial
@@ -404,24 +345,34 @@ where
         }
     }
 
-    /// 执行一轮并处理退避:本轮超时则等待退避时间(可被停止信号打断),
-    /// 返回 `true` 表示因停止信号提前退出。
-    /// 非超时结果(成功或普通失败)将退避复位。
-    async fn run_round(
+    /// 执行一轮:`run → validate(仅成功时) → teardown(finally)`。
+    /// 返回 `true` 表示本轮超时后的退避等待被停止信号打断。
+    ///
+    /// 退避只由 `run` 的超时驱动:`teardown` 的耗时与失败都不参与退避。
+    async fn round(
+        &self,
         ctx: &S::Ctx,
         task: &TaskIndex,
         setup: &S::Setup,
         recorder: &mut Recorder,
-        shutdown: Option<&Shutdown>,
-        backoff: Option<BackoffConfig>,
         wait: &mut Duration,
     ) -> bool {
-        let timed_out = Self::run_and_validate(ctx, task, setup, recorder).await;
-        let Some(cfg) = backoff else {
+        let result = Self::once(ctx, task, setup, recorder).await;
+        let timed_out = result.as_ref().is_err_and(|e| e.is_timeout());
+        // run 失败已记录,不再进入 validate
+        if let Ok(output) = &result {
+            Self::validate(ctx, task, setup, output, recorder).await;
+        }
+        // 轮级收尾:finally 语义——run/validate 无论成败都会执行
+        if S::TEARDOWN_MODE == TeardownMode::Round {
+            Self::teardown(ctx, task, setup, Some(result.as_ref()), recorder).await;
+        }
+
+        let Some(cfg) = self.config.backoff else {
             return false;
         };
         if timed_out {
-            if Self::wait_or_cancel(shutdown, *wait).await {
+            if self.wait_or_cancel(*wait).await {
                 return true;
             }
             // 指数增长,封顶 max,不低于 initial
@@ -435,8 +386,8 @@ where
     }
 
     /// 退避等待;绑定停止信号时,信号到达立即返回 `true`。
-    async fn wait_or_cancel(shutdown: Option<&Shutdown>, duration: Duration) -> bool {
-        match shutdown {
+    async fn wait_or_cancel(&self, duration: Duration) -> bool {
+        match self.config.shutdown.as_ref() {
             Some(s) => tokio::select! {
                 _ = tokio::time::sleep(duration) => false,
                 _ = s.wait_cancelled() => true,
@@ -484,7 +435,9 @@ where
         output: &S::Output,
         recorder: &mut Recorder,
     ) {
+        let start = Instant::now();
         let ret = S::validate(ctx, task, setup, output).await;
+        recorder.record_validate_duration(start.elapsed());
         match ret {
             Ok(true) => {
                 recorder.record_validate(true);
@@ -495,6 +448,32 @@ where
             Err(err) => {
                 recorder.log_internal(format!("{err:?}"));
                 recorder.record_validate_failure(err.kind());
+            }
+        }
+    }
+
+    /// 收尾阶段:记录耗时与结果。
+    ///
+    /// finally 语义——`run`/`validate` 无论成败都会调用,且不可被停止信号打断。
+    /// 失败只记账(`teardown_failures` + `teardown:{kind}` 错误明细),
+    /// 不加剧 `failures`/`timeouts`,不触发退避,也不中止任务。
+    /// `result` 为该轮 `run` 的结果(`TEARDOWN_MODE = Round`);任务级收尾传 `None`。
+    async fn teardown(
+        ctx: &S::Ctx,
+        task: &TaskIndex,
+        setup: &S::Setup,
+        result: Option<Result<&S::Output, &S::Error>>,
+        recorder: &mut Recorder,
+    ) {
+        let start = Instant::now();
+        let ret = S::teardown(ctx, task, setup, result).await;
+        recorder.record_teardown_duration(start.elapsed());
+        match ret {
+            Ok(()) => recorder.record_teardown(true),
+            Err(err) => {
+                recorder.log_internal(format!("{err:?}"));
+                recorder.record_teardown(false);
+                recorder.record_teardown_error(err.kind());
             }
         }
     }

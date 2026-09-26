@@ -31,9 +31,11 @@
 //!
 //!     // task 是框架分配的并发任务身份(task.index 可用于账号参数化,
 //!     // task.round 为全局运行编号, 每轮取号);
-//!     // validate() / name() / setup() 均有默认实现,按需覆盖即可;
+//!     // validate() / name() / setup() / teardown() 均有默认实现,按需覆盖即可;
 //!     // 覆盖 validate 时可接收 run 的产出(output)做业务断言;
-//!     // run 返回 Err 时该轮直接记为失败,不会进入 validate
+//!     // run 返回 Err 时该轮直接记为失败,不会进入 validate;
+//!     // teardown() 为收尾阶段(finally 语义,失败不中止任务),
+//!     // 粒度由 TEARDOWN_MODE 控制(Task 每任务一次 / Round 每轮一次)
 //! }
 //!
 //! // 在模块底部注册。可选配置:

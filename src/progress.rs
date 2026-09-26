@@ -142,6 +142,8 @@ struct Inner {
     /// 超时类软失败次数(与报告 `timeouts` 对齐,由 `timeout_recorded` 累加)
     timeouts: AtomicU64,
     validate_failures: AtomicU64,
+    /// 收尾失败次数(不参与 succ/err 统计,单独展示)
+    teardown_failures: AtomicU64,
     /// 当前在途请求数(`begin_round` / `end_round` 维护)
     in_flight: AtomicU64,
     /// 当前处于 setup 阶段的任务数
@@ -172,6 +174,7 @@ impl Progress {
                 failures: AtomicU64::new(0),
                 timeouts: AtomicU64::new(0),
                 validate_failures: AtomicU64::new(0),
+                teardown_failures: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 in_setup: AtomicU64::new(0),
                 stop: AtomicBool::new(false),
@@ -276,6 +279,13 @@ impl Progress {
         }
     }
 
+    /// 记录一次 teardown 失败(成功不计数,避免刷屏)
+    pub(crate) fn teardown_recorded(&self, ok: bool) {
+        if !ok {
+            self.inner.teardown_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// 框架内部日志进 TUI 日志缓冲(带时间前缀);无缓冲时返回 `false`,由调用方落 tracing。
     pub(crate) fn push_log(&self, line: &str) -> bool {
         if let Some(channel) = &self.inner.log {
@@ -375,6 +385,15 @@ fn render_line(inner: &Inner, stopping: bool, color: bool, bar_width: usize) -> 
                 line,
                 "  {}",
                 paint(&format!("timeout {timeouts}"), "33", color)
+            );
+        }
+        // 收尾失败单列(不计入 err):便于区分“压测失败”与“收尾失败”
+        let teardown_failures = inner.teardown_failures.load(Ordering::Relaxed);
+        if teardown_failures > 0 {
+            let _ = write!(
+                line,
+                "  {}",
+                paint(&format!("cleanup {teardown_failures}"), "31", color)
             );
         }
     }
@@ -486,6 +505,30 @@ mod tests {
         // 无轮次完成时不显示 succ/err
         assert!(!line.contains("succ"), "{line}");
         assert!(!line.contains("err"), "{line}");
+    }
+
+    #[test]
+    fn line_shows_teardown_failures_separately() {
+        let p = Progress::new("scn", ProgressPlan::Rounds(10), None, 0, 1);
+        p.round_recorded();
+        p.result_recorded(true);
+        p.teardown_recorded(true);
+        p.teardown_recorded(false);
+        p.teardown_recorded(false);
+
+        let line = render_line(&p.inner, false, false, 20);
+        assert!(line.contains("cleanup 2"), "{line}");
+        // 收尾失败不计入 err(载荷侧口径不变)
+        assert!(line.contains("succ 1"), "{line}");
+        assert!(!line.contains("err"), "{line}");
+        assert!(!line.contains("fail"), "{line}");
+
+        // 收尾全部成功时不占用进度行
+        let ok = Progress::new("ok", ProgressPlan::Rounds(10), None, 0, 1);
+        ok.round_recorded();
+        ok.teardown_recorded(true);
+        let line = render_line(&ok.inner, false, false, 20);
+        assert!(!line.contains("cleanup"), "{line}");
     }
 
     #[test]

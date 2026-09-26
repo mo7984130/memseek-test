@@ -27,6 +27,11 @@ fn sample_report(
         p99: Duration::from_millis(80),
         validate_success: success,
         validate_failures: failures,
+        setup_total: Duration::ZERO,
+        validate_total: Duration::ZERO,
+        teardown_total: Duration::ZERO,
+        teardown_success: 0,
+        teardown_failures: 0,
         success,
         failures,
         timeouts: 0,
@@ -120,6 +125,47 @@ fn report_with_works_on_vec_and_slice() {
     assert!(reports.report_with(opts).contains("Summary"));
     // slice 调用 report_with
     assert!(reports.as_slice().report_with(opts).contains("Summary"));
+}
+
+/// 阶段耗时与收尾统计:仅在用到时渲染,且不改变有效通过口径。
+#[test]
+fn teardown_stats_render_when_present() {
+    let mut r = sample_report("cleanup", 100, 98, 0, 4);
+    r.setup_total = Duration::from_millis(200);
+    r.validate_total = Duration::from_millis(10);
+    r.teardown_total = Duration::from_millis(30);
+    r.teardown_success = 3;
+    r.teardown_failures = 1;
+    r.error_map.insert(Cow::Borrowed("teardown:timeout"), 1);
+
+    let text = r.report();
+    assert!(text.contains("Cleanup  : 3 ok / 1 fail"), "{text}");
+    assert!(
+        text.contains("Stages   : setup 200.00ms | validate 10.00ms | teardown 30.00ms"),
+        "{text}"
+    );
+    assert!(text.contains("teardown:timeout"), "{text}");
+    // 收尾失败不计入 failures、也不影响有效通过率
+    assert!(text.contains("98 (98.0%)"), "{text}");
+    assert!(text.contains("Failures : 0 (0.0%)"), "{text}");
+
+    // 未启用阶段时不引入新行(历史输出稳定)
+    let plain = sample_report("plain", 10, 10, 0, 1).report();
+    assert!(!plain.contains("Cleanup"), "{plain}");
+    assert!(!plain.contains("Stages"), "{plain}");
+}
+
+/// 多场景汇总同样带上收尾统计。
+#[test]
+fn multi_report_summarizes_teardown() {
+    let mut a = sample_report("a", 10, 10, 0, 2);
+    a.teardown_success = 2;
+    a.teardown_total = Duration::from_millis(4);
+    let b = sample_report("b", 10, 10, 0, 2);
+
+    let text = vec![a, b].report();
+    assert!(text.contains("Cleanup   : 2 ok / 0 fail"), "{text}");
+    assert!(text.contains("teardown 4.00ms"), "{text}");
 }
 
 #[test]

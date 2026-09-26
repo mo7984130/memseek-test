@@ -27,6 +27,16 @@ pub struct ScenarioReport {
     pub validate_success: u64,
     pub validate_failures: u64,
 
+    /// 各任务 `setup` 尝试耗时之和(含超时重试的每次尝试;与墙钟口径不同)
+    pub setup_total: Duration,
+    /// 各轮 `validate` 耗时之和
+    pub validate_total: Duration,
+    /// 各次 `teardown` 耗时之和
+    pub teardown_total: Duration,
+    /// 收尾成功/失败次数(失败不进 `failures`,也不影响通过率)
+    pub teardown_success: u64,
+    pub teardown_failures: u64,
+
     pub success: u64,
     pub failures: u64,
     /// 超时类软失败数(单独统计,不加剧失败率)
@@ -60,6 +70,12 @@ impl ScenarioReport {
             validate_success: recorder.validate_success,
             validate_failures: recorder.validate_failures,
 
+            setup_total: recorder.setup_total,
+            validate_total: recorder.validate_total,
+            teardown_total: recorder.teardown_total,
+            teardown_success: recorder.teardown_success,
+            teardown_failures: recorder.teardown_failures,
+
             success: recorder.success,
             failures: recorder.failures,
             timeouts: recorder.timeouts,
@@ -85,6 +101,21 @@ impl Display for ScenarioReport {
 
         writeln!(f, "  Validate Success:  {}", self.validate_success)?;
         writeln!(f, "  Validate Failures: {}", self.validate_failures)?;
+        // 阶段耗时与收尾计数仅在用到对应阶段时输出(未实现时不打扰输出)
+        if self.setup_total > Duration::ZERO {
+            writeln!(f, "  Setup Total:    {}", fmt_duration(self.setup_total))?;
+        }
+        if self.validate_total > Duration::ZERO {
+            writeln!(f, "  Validate Total: {}", fmt_duration(self.validate_total))?;
+        }
+        if self.teardown_success + self.teardown_failures > 0 {
+            writeln!(f, "  Teardown Total: {}", fmt_duration(self.teardown_total))?;
+            writeln!(
+                f,
+                "  Teardown: {} ok / {} fail",
+                self.teardown_success, self.teardown_failures,
+            )?;
+        }
 
         writeln!(f, "  Success: {}", self.success)?;
         writeln!(f, "  Failures: {}", self.failures)?;
@@ -178,8 +209,14 @@ impl Report for Vec<ScenarioReport> {
 /// 有效通过轮数:`run` 成功且业务校验(validate)通过。
 /// validate 失败的轮次虽然计入 `success`(HTTP/业务请求本身成功),
 /// 但断言未通过,不能视为通过。
+/// 收尾(teardown)失败单独计数,不影响这里的通过口径。
 fn passed_rounds(success: u64, validate_failures: u64) -> u64 {
     success.saturating_sub(validate_failures)
+}
+
+/// error 明细的分母:四类失败事件之和(每类都会写入 `error_map`,可对账)。
+fn error_events(r: &ScenarioReport) -> u64 {
+    r.failures + r.timeouts + r.validate_failures + r.teardown_failures
 }
 
 fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
@@ -233,6 +270,27 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
         r.validate_success, r.validate_failures,
     )
     .unwrap();
+    if r.teardown_success + r.teardown_failures > 0 {
+        writeln!(
+            out,
+            "Cleanup  : {} ok / {} fail",
+            r.teardown_success, r.teardown_failures,
+        )
+        .unwrap();
+    }
+    // 各阶段耗时合计:跨任务累加(可与墙钟 elapsed 重叠),
+    // 用于解释 RPS 与 Total 的差距;未用到任何阶段时不输出。
+    let stage_total = r.setup_total + r.validate_total + r.teardown_total;
+    if stage_total > Duration::ZERO {
+        writeln!(
+            out,
+            "Stages   : setup {} | validate {} | teardown {} (summed over tasks)",
+            fmt_duration(r.setup_total),
+            fmt_duration(r.validate_total),
+            fmt_duration(r.teardown_total),
+        )
+        .unwrap();
+    }
     if r.interrupted {
         writeln!(
             out,
@@ -270,10 +328,10 @@ fn render_single(r: &ScenarioReport, o: &ReportOptions) -> String {
         writeln!(out).unwrap();
         writeln!(out, "Errors:").unwrap();
 
-        // 明细包含 run 失败、超时与 validate 失败;分母为全部非成功轮,保证占比对账
+        // 明细包含 run 失败、超时、validate 失败与收尾失败;分母为全部失败事件数,保证占比对账
         let mut errs: Vec<_> = r.error_map.iter().collect();
         errs.sort_by(|a, b| b.1.cmp(a.1));
-        let denom = (r.failures + r.timeouts + r.validate_failures).max(1) as f64;
+        let denom = error_events(r).max(1) as f64;
         for (kind, count) in errs {
             let frac = *count as f64 / denom;
             writeln!(
@@ -305,6 +363,11 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
     let total_timeouts: u64 = reports.iter().map(|r| r.timeouts).sum();
     let total_validate_success: u64 = reports.iter().map(|r| r.validate_success).sum();
     let total_validate_failures: u64 = reports.iter().map(|r| r.validate_failures).sum();
+    let total_teardown_success: u64 = reports.iter().map(|r| r.teardown_success).sum();
+    let total_teardown_failures: u64 = reports.iter().map(|r| r.teardown_failures).sum();
+    let total_setup: Duration = reports.iter().map(|r| r.setup_total).sum();
+    let total_validate: Duration = reports.iter().map(|r| r.validate_total).sum();
+    let total_teardown: Duration = reports.iter().map(|r| r.teardown_total).sum();
     let total_total: Duration = reports.iter().map(|r| r.total).sum();
     // 多场景由 Manager 串行执行,汇总墙钟 = 各场景 elapsed 之和
     let total_elapsed: Duration = reports.iter().map(|r| r.elapsed).sum();
@@ -368,6 +431,25 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         total_validate_success, total_validate_failures,
     )
     .unwrap();
+    if total_teardown_success + total_teardown_failures > 0 {
+        writeln!(
+            out,
+            "Cleanup   : {} ok / {} fail",
+            total_teardown_success, total_teardown_failures,
+        )
+        .unwrap();
+    }
+    // 各阶段耗时合计(跨任务累加,可与墙钟重叠);未用到任何阶段时不输出
+    if total_setup + total_validate + total_teardown > Duration::ZERO {
+        writeln!(
+            out,
+            "Stages    : setup {} | validate {} | teardown {} (summed over tasks)",
+            fmt_duration(total_setup),
+            fmt_duration(total_validate),
+            fmt_duration(total_teardown),
+        )
+        .unwrap();
+    }
     let interrupted_count = reports.iter().filter(|r| r.interrupted).count();
     if interrupted_count > 0 {
         writeln!(
@@ -445,10 +527,10 @@ fn render_many(reports: &[ScenarioReport], o: &ReportOptions) -> String {
         for r in err_rows {
             writeln!(out, "{}", paint(&format!("  {}.", r.name), "1", o.color)).unwrap();
 
-            // 明细包含 run 失败、超时与 validate 失败;分母为全部非成功轮,保证占比对账
+            // 明细包含 run 失败、超时、validate 失败与收尾失败;分母为全部失败事件数,保证占比对账
             let mut errs: Vec<_> = r.error_map.iter().collect();
             errs.sort_by(|a, b| b.1.cmp(a.1));
-            let denom = (r.failures + r.timeouts + r.validate_failures).max(1) as f64;
+            let denom = error_events(r).max(1) as f64;
             for (kind, count) in errs {
                 let frac = *count as f64 / denom;
                 writeln!(
