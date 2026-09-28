@@ -123,6 +123,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 register_scenario!(HealthScenario, name = "health", mode = RunMode::Times(1_000));
 ```
 
+## 可运行示例
+
+`examples/` 下每个示例对应上面一个主题,都能直接跑:
+
+| 示例 | 跑法 | 演示什么 |
+| --- | --- | --- |
+| `quickstart` | `cargo run --example quickstart` | `Times` 模式 + `validate` 对账 + CI 判定,**不需要任何外部服务** |
+| `http` | `cargo run --example http` | `Client`、请求构造、`send_checked`、错误分类(需先起一个本地 HTTP 服务) |
+| `graceful_shutdown` | `cargo run --example graceful_shutdown` | 程序化优雅停止、按名执行单个场景、`report.interrupted` |
+| `per_round_setup` | `cargo run --example per_round_setup` | 按轮的 `setup`/`teardown`、finally 语义、`teardown_failures` 单列 |
+| `tui` | `cargo run --example tui --features tui` | 全屏进度与日志滚动区接线 |
+
 ## 真实用法: 后端 e2e 正确性套件
 
 下面摘自一个真实 Rust 后端项目的 e2e 套件(63 个场景:auth 8 / user 22 / visual 32 / system 1)——它的主用途就是**上线前的正确性验收**:`run` 打接口,`validate` 拿响应和数据库逐字段对账。
