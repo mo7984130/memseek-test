@@ -36,11 +36,11 @@
 
 ```toml
 [dependencies]
-memseek-test = "0.23"
+memseek-test = "0.24"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # 需要全屏 TUI 时:
-# memseek-test = { version = "0.23", features = ["tui"] }
+# memseek-test = { version = "0.24", features = ["tui"] }
 ```
 
 需要 Rust 1.88+(edition 2024;此下界由 `hdrhistogram` 与 url→idna→icu 依赖链决定),并且请使用**多线程** tokio 运行时——TUI 渲染与 Ctrl-C 监听都是在后台 spawn 出来的,`current_thread` 运行时下它们会被饿死(框架检测到会给出警告)。
