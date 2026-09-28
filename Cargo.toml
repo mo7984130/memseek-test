@@ -30,9 +30,15 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 url = "2.5.8"
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["net", "time", "macros"] }
+# examples 里的 #[tokio::main] 需要 rt-multi-thread(TUI 渲染与 Ctrl-C 监听靠 spawn)
+tokio = { version = "1.53.1", features = ["net", "time", "macros", "rt-multi-thread"] }
 
 [features]
 default = []
 # 终端 TUI 模式:全屏显示实时进度 + 日志滚动区(需要 tracing-subscriber 接入业务日志)
 tui = ["dep:tracing-subscriber"]
+
+# 只有开了 tui feature 才能构建这个示例
+[[example]]
+name = "tui"
+required-features = ["tui"]
