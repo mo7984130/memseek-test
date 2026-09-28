@@ -9,6 +9,11 @@ homepage = "https://github.com/mo7984130/memseek-test"
 documentation = "https://docs.rs/memseek-test"
 keywords = ["load-testing", "benchmark", "testing", "http", "async"]
 categories = ["development-tools::testing", "asynchronous"]
+rust-version = "1.88"
+exclude = [".commandcode/**", "example/**"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 futures = "0.3.34"
